@@ -18,6 +18,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -256,7 +257,9 @@ public final class LocalApiServer {
             sendJson(out, 400, OpenAIResponse.error("'messages' is required", "invalid_request_error"));
             return;
         }
-        String prompt = OpenAIResponse.buildPrompt(msgs);
+        JSONArray tools = OpenAIResponse.extractTools(body);
+        Set<String> toolNames = OpenAIResponse.toolNames(tools);
+        String prompt = OpenAIResponse.buildPrompt(msgs, tools, body.opt("tool_choice"));
         if (prompt.trim().isEmpty()) {
             sendJson(out, 400, OpenAIResponse.error("Messages have no text content", "invalid_request_error"));
             return;
@@ -271,14 +274,16 @@ public final class LocalApiServer {
         boolean includeUsage = so != null && so.optBoolean("include_usage", false);
 
         ChatJob job = new ChatJob(prompt, model, think, search, stream);
-        AppState.log("API request · " + model + (stream ? " · stream" : ""));
+        AppState.log("API request · " + model + (stream ? " · stream" : "")
+                + (tools != null ? " · " + tools.length() + " tools" : ""));
         RequestQueue.get().submit(job);
 
-        if (stream) streamResponse(job, out, includeUsage);
-        else blockingResponse(job, out);
+        if (stream) streamResponse(job, out, includeUsage, tools != null ? toolNames : null);
+        else blockingResponse(job, out, tools != null ? toolNames : null);
     }
 
-    private void blockingResponse(ChatJob job, OutputStream out) throws IOException {
+    /** toolNames null = request mein tools nahi the. */
+    private void blockingResponse(ChatJob job, OutputStream out, Set<String> toolNames) throws IOException {
         boolean done;
         try {
             done = job.awaitClosed(JOB_WAIT_MS);
@@ -295,13 +300,17 @@ public final class LocalApiServer {
             sendJson(out, 502, OpenAIResponse.error(job.errorMessage(), "upstream_error"));
             return;
         }
-        sendJson(out, 200, OpenAIResponse.completion(job));
+        ToolCallParser.Result tr = toolNames != null ? ToolCallParser.parse(job.content(), toolNames) : null;
+        if (tr != null && tr.hasCalls()) AppState.log("Tool calls: " + tr.toolCalls.length());
+        sendJson(out, 200, OpenAIResponse.completion(job, tr));
     }
 
-    private void streamResponse(ChatJob job, OutputStream out, boolean includeUsage) throws IOException {
+    private void streamResponse(ChatJob job, OutputStream out, boolean includeUsage, Set<String> toolNames)
+            throws IOException {
         writeHead(out, 200, "text/event-stream; charset=utf-8", -1, true);
         Chunked w = new Chunked(out);
         boolean roleSent = false;
+        ToolCallParser.StreamFilter filter = toolNames != null ? new ToolCallParser.StreamFilter() : null;
         long deadline = System.currentTimeMillis() + JOB_WAIT_MS;
         try {
             while (true) {
@@ -327,10 +336,42 @@ public final class LocalApiServer {
                     roleSent = true;
                 }
                 if (ev.type == ChatJob.EV_CHUNK) {
-                    String key = ev.think ? "reasoning_content" : "content";
-                    w.write(sse(OpenAIResponse.chunk(job, OpenAIResponse.delta(key, ev.text), null)));
+                    if (ev.think) {
+                        w.write(sse(OpenAIResponse.chunk(job, OpenAIResponse.delta("reasoning_content", ev.text), null)));
+                    } else {
+                        String text = filter != null ? filter.feed(ev.text) : ev.text;
+                        if (!text.isEmpty()) {
+                            w.write(sse(OpenAIResponse.chunk(job, OpenAIResponse.delta("content", text), null)));
+                        }
+                    }
                 } else if (ev.type == ChatJob.EV_DONE) {
-                    w.write(sse(OpenAIResponse.chunk(job, new JSONObject(), ev.text)));
+                    String finish = ev.text;
+                    if (filter != null) {
+                        String tail = filter.flush();
+                        if (!tail.isEmpty()) {
+                            w.write(sse(OpenAIResponse.chunk(job, OpenAIResponse.delta("content", tail), null)));
+                        }
+                        if (filter.isCapturing()) {
+                            String full = job.content();
+                            ToolCallParser.Result tr = ToolCallParser.parse(full, toolNames);
+                            if (tr.hasCalls()) {
+                                AppState.log("Tool calls: " + tr.toolCalls.length());
+                                for (int i = 0; i < tr.toolCalls.length(); i++) {
+                                    w.write(sse(OpenAIResponse.chunk(job,
+                                            OpenAIResponse.toolCallDelta(tr.toolCalls.optJSONObject(i), i), null)));
+                                }
+                                finish = "tool_calls";
+                            } else {
+                                // Marker mila par parse nahi hua: roka hua text bhej do
+                                int from = Math.min(filter.emittedChars(), full.length());
+                                String rest = full.substring(from);
+                                if (!rest.isEmpty()) {
+                                    w.write(sse(OpenAIResponse.chunk(job, OpenAIResponse.delta("content", rest), null)));
+                                }
+                            }
+                        }
+                    }
+                    w.write(sse(OpenAIResponse.chunk(job, new JSONObject(), finish)));
                     if (includeUsage) w.write(sse(OpenAIResponse.usageChunk(job)));
                     break;
                 } else if (ev.type == ChatJob.EV_ERROR) {

@@ -3,12 +3,17 @@ package com.deepsek.suvo;
 import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
+import org.json.JSONTokener;
 
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
 
-/** OpenAI-compatible JSON builders + messages -> single prompt conversion. */
+/** OpenAI-compatible JSON builders + messages/tools -> single prompt conversion. */
 public final class OpenAIResponse {
 
     public static final String[] MODELS = {
@@ -43,6 +48,18 @@ public final class OpenAIResponse {
         return Math.max(1, ascii / 4 + other);
     }
 
+    private static Object parseArgs(Object args) {
+        if (args == null || args == JSONObject.NULL) return new JSONObject();
+        if (args instanceof JSONObject || args instanceof JSONArray) return args;
+        String s = String.valueOf(args).trim();
+        if (s.isEmpty()) return new JSONObject();
+        try {
+            return new JSONTokener(s).nextValue();
+        } catch (JSONException e) {
+            return s;
+        }
+    }
+
     /* ---------------------------------------------------------------- model flags */
 
     public static boolean wantsThinking(String model, JSONObject body) {
@@ -57,6 +74,90 @@ public final class OpenAIResponse {
     public static boolean wantsSearch(String model, JSONObject body) {
         String m = model.toLowerCase(Locale.ROOT);
         return m.contains("search") || body.optBoolean("web_search", false) || body.optBoolean("search", false);
+    }
+
+    /* ---------------------------------------------------------------- tools */
+
+    /** "tools" ya purana "functions" field -> standard tools array. "tool_choice": "none" = null. */
+    public static JSONArray extractTools(JSONObject body) {
+        Object choice = body.opt("tool_choice");
+        if ("none".equals(choice)) return null;
+
+        JSONArray tools = body.optJSONArray("tools");
+        if (tools == null || tools.length() == 0) {
+            JSONArray fns = body.optJSONArray("functions");
+            if (fns == null || fns.length() == 0) return null;
+            tools = new JSONArray();
+            for (int i = 0; i < fns.length(); i++) {
+                JSONObject f = fns.optJSONObject(i);
+                if (f != null) tools.put(obj("type", "function", "function", f));
+            }
+        }
+        return tools.length() == 0 ? null : tools;
+    }
+
+    public static Set<String> toolNames(JSONArray tools) {
+        Set<String> names = new HashSet<>();
+        if (tools == null) return names;
+        for (int i = 0; i < tools.length(); i++) {
+            JSONObject t = tools.optJSONObject(i);
+            if (t == null) continue;
+            JSONObject fn = t.optJSONObject("function");
+            String n = (fn != null ? fn : t).optString("name", "");
+            if (!n.isEmpty()) names.add(n);
+        }
+        return names;
+    }
+
+    private static String toolsSection(JSONArray tools, Object toolChoice) {
+        JSONArray compact = new JSONArray();
+        for (int i = 0; i < tools.length(); i++) {
+            JSONObject t = tools.optJSONObject(i);
+            if (t == null) continue;
+            JSONObject fn = t.optJSONObject("function");
+            if (fn == null) fn = t;
+            String name = fn.optString("name", "");
+            if (name.isEmpty()) continue;
+            JSONObject c = obj("name", name);
+            try {
+                String desc = fn.optString("description", "");
+                if (!desc.isEmpty()) c.put("description", desc);
+                Object params = fn.opt("parameters");
+                if (params == null) params = fn.opt("input_schema");
+                c.put("parameters", params == null ? obj("type", "object", "properties", new JSONObject()) : params);
+            } catch (JSONException ignored) {
+            }
+            compact.put(c);
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("# Available tools\n")
+                .append("You can use the following tools. Definitions (JSON):\n")
+                .append("<tools>\n").append(compact.toString()).append("\n</tools>\n\n")
+                .append("## How to call tools\n")
+                .append("When you need a tool, output EXACTLY this format, and write nothing after it:\n")
+                .append("<tool_calls>\n")
+                .append("[{\"name\": \"TOOL_NAME\", \"arguments\": {\"param\": \"value\"}}]\n")
+                .append("</tool_calls>\n\n")
+                .append("Rules:\n")
+                .append("- The text between the tags MUST be a valid JSON array.\n")
+                .append("- \"arguments\" MUST be a JSON object that matches the tool's \"parameters\" schema.\n")
+                .append("- To call several tools at once, put several objects in the same array.\n")
+                .append("- Never invent or guess tool results. After calling, stop and wait; ")
+                .append("results arrive as [TOOL RESULT] messages.\n")
+                .append("- Do NOT use any other format (no <tool_call>, no <arg>, no markdown code blocks).\n")
+                .append("- If no tool is needed, answer normally in plain text without the tags.\n");
+
+        if ("required".equals(toolChoice) || "any".equals(toolChoice)) {
+            sb.append("- In this reply you MUST call at least one tool.\n");
+        } else if (toolChoice instanceof JSONObject) {
+            JSONObject fn = ((JSONObject) toolChoice).optJSONObject("function");
+            String forced = fn != null ? fn.optString("name", "") : ((JSONObject) toolChoice).optString("name", "");
+            if (!forced.isEmpty()) {
+                sb.append("- In this reply you MUST call the tool \"").append(forced).append("\".\n");
+            }
+        }
+        return sb.toString();
     }
 
     /* ---------------------------------------------------------------- prompt */
@@ -77,6 +178,9 @@ public final class OpenAIResponse {
                     if (p.has("text")) {
                         if (sb.length() > 0) sb.append('\n');
                         sb.append(p.optString("text"));
+                    } else if ("tool_result".equals(type) && p.has("content")) {
+                        if (sb.length() > 0) sb.append('\n');
+                        sb.append(textOf(p.opt("content")));
                     } else if (type.contains("image")) {
                         if (sb.length() > 0) sb.append('\n');
                         sb.append("[image omitted]");
@@ -89,41 +193,83 @@ public final class OpenAIResponse {
         return String.valueOf(content);
     }
 
+    /** Assistant ke purane tool_calls ko usi <tool_calls> format mein likho jo model ko sikhaya hai. */
+    private static String renderAssistantCalls(JSONObject m, Map<String, String> idToName) {
+        JSONArray simple = new JSONArray();
+        JSONArray calls = m.optJSONArray("tool_calls");
+        if (calls != null) {
+            for (int i = 0; i < calls.length(); i++) {
+                JSONObject c = calls.optJSONObject(i);
+                if (c == null) continue;
+                JSONObject fn = c.optJSONObject("function");
+                if (fn == null) continue;
+                String name = fn.optString("name", "");
+                String id = c.optString("id", "");
+                if (!id.isEmpty()) idToName.put(id, name);
+                simple.put(obj("name", name, "arguments", parseArgs(fn.opt("arguments"))));
+            }
+        }
+        JSONObject legacy = m.optJSONObject("function_call");
+        if (legacy != null) {
+            simple.put(obj("name", legacy.optString("name", ""), "arguments", parseArgs(legacy.opt("arguments"))));
+        }
+        if (simple.length() == 0) return "";
+        return "<tool_calls>\n" + simple + "\n</tool_calls>";
+    }
+
     /**
-     * Har request fresh chat mein jaati hai, isliye pura conversation ek prompt mein
-     * flatten hota hai. Sirf ek user message ho toh as-is bheja jata hai.
+     * Har request fresh chat mein jaati hai, isliye system + tools + pura conversation
+     * ek prompt mein flatten hota hai.
      */
-    public static String buildPrompt(JSONArray messages) {
+    public static String buildPrompt(JSONArray messages, JSONArray tools, Object toolChoice) {
+        boolean hasTools = tools != null && tools.length() > 0;
+        Map<String, String> idToName = new HashMap<>();
         List<String[]> list = new ArrayList<>();
         boolean hasHistory = false;
+
         for (int i = 0; i < messages.length(); i++) {
             JSONObject m = messages.optJSONObject(i);
             if (m == null) continue;
             String role = m.optString("role", "user").toLowerCase(Locale.ROOT);
             String text = textOf(m.opt("content")).trim();
+            String label;
 
-            if ("assistant".equals(role)) {
-                JSONArray calls = m.optJSONArray("tool_calls");
-                if (calls != null && calls.length() > 0) {
-                    text = (text.isEmpty() ? "" : text + "\n") + "(called tools: " + calls + ")";
+            switch (role) {
+                case "system":
+                case "developer":
+                    label = "SYSTEM";
+                    break;
+                case "assistant": {
+                    hasHistory = true;
+                    label = "ASSISTANT";
+                    String calls = renderAssistantCalls(m, idToName);
+                    if (!calls.isEmpty()) text = text.isEmpty() ? calls : text + "\n" + calls;
+                    break;
                 }
-                hasHistory = true;
-            } else if ("tool".equals(role) || "function".equals(role)) {
-                hasHistory = true;
-                String name = m.optString("name", m.optString("tool_call_id", ""));
-                role = "tool" + (name.isEmpty() ? "" : " " + name);
+                case "tool":
+                case "function": {
+                    hasHistory = true;
+                    String id = m.optString("tool_call_id", "");
+                    String name = m.optString("name", "");
+                    if (name.isEmpty() && idToName.containsKey(id)) name = idToName.get(id);
+                    label = "TOOL RESULT" + (name.isEmpty() ? "" : ": " + name);
+                    if (text.isEmpty()) text = "(empty result)";
+                    break;
+                }
+                default:
+                    label = "USER";
             }
             if (text.isEmpty()) continue;
-            list.add(new String[]{role, text});
+            list.add(new String[]{label, text});
         }
         if (list.isEmpty()) return "";
 
-        if (!hasHistory) {
-            // system + user(s): seedha jod do
+        // Simple case: tools nahi, history nahi -> seedha text
+        if (!hasTools && !hasHistory) {
             StringBuilder sys = new StringBuilder();
             StringBuilder usr = new StringBuilder();
             for (String[] r : list) {
-                StringBuilder target = ("system".equals(r[0]) || "developer".equals(r[0])) ? sys : usr;
+                StringBuilder target = "SYSTEM".equals(r[0]) ? sys : usr;
                 if (target.length() > 0) target.append("\n\n");
                 target.append(r[1]);
             }
@@ -132,10 +278,12 @@ public final class OpenAIResponse {
         }
 
         StringBuilder sb = new StringBuilder();
-        sb.append("Continue the conversation below. Reply ONLY with the next assistant message, ")
+        if (hasTools) sb.append(toolsSection(tools, toolChoice)).append('\n');
+        sb.append("# Conversation\n")
+                .append("Continue the conversation below. Reply ONLY with the next ASSISTANT message, ")
                 .append("without any role label or prefix.\n\n");
         for (String[] r : list) {
-            sb.append('[').append(r[0].toUpperCase(Locale.ROOT)).append("]\n").append(r[1]).append("\n\n");
+            sb.append('[').append(r[0]).append("]\n").append(r[1]).append("\n\n");
         }
         sb.append("[ASSISTANT]\n");
         return sb.toString();
@@ -158,17 +306,25 @@ public final class OpenAIResponse {
         return obj("prompt_tokens", p, "completion_tokens", c, "total_tokens", p + c);
     }
 
-    public static JSONObject completion(ChatJob job) {
-        JSONObject message = obj("role", "assistant", "content", job.content());
-        String r = job.reasoning();
-        if (!r.isEmpty()) {
-            try {
-                message.put("reasoning_content", r);
-            } catch (JSONException ignored) {
+    /** Non-stream response. toolResult null = tools nahi bheje the. */
+    public static JSONObject completion(ChatJob job, ToolCallParser.Result toolResult) {
+        String content = job.content();
+        String finish = job.finishReason();
+        JSONObject message = obj("role", "assistant");
+        try {
+            if (toolResult != null && toolResult.hasCalls()) {
+                message.put("content", toolResult.content.isEmpty() ? JSONObject.NULL : toolResult.content);
+                message.put("tool_calls", toolResult.toolCalls);
+                finish = "tool_calls";
+            } else {
+                message.put("content", content);
             }
+            String r = job.reasoning();
+            if (!r.isEmpty()) message.put("reasoning_content", r);
+        } catch (JSONException ignored) {
         }
         JSONArray choices = new JSONArray();
-        choices.put(obj("index", 0, "message", message, "finish_reason", job.finishReason()));
+        choices.put(obj("index", 0, "message", message, "finish_reason", finish));
         return obj(
                 "id", "chatcmpl-" + job.id,
                 "object", "chat.completion",
@@ -188,6 +344,21 @@ public final class OpenAIResponse {
                 "created", job.created,
                 "model", job.model,
                 "choices", choices);
+    }
+
+    /** Streaming tool call delta: OpenAI format mein har call ka index ke saath. */
+    public static JSONObject toolCallDelta(JSONObject call, int index) {
+        JSONObject fn = call.optJSONObject("function");
+        JSONObject c = obj(
+                "index", index,
+                "id", call.optString("id"),
+                "type", "function",
+                "function", obj(
+                        "name", fn == null ? "" : fn.optString("name"),
+                        "arguments", fn == null ? "{}" : fn.optString("arguments", "{}")));
+        JSONArray arr = new JSONArray();
+        arr.put(c);
+        return obj("tool_calls", arr);
     }
 
     public static JSONObject usageChunk(ChatJob job) {
