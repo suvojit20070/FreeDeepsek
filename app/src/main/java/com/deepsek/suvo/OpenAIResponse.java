@@ -134,18 +134,37 @@ public final class OpenAIResponse {
         sb.append("# Available tools\n")
                 .append("You can use the following tools. Definitions (JSON):\n")
                 .append("<tools>\n").append(compact.toString()).append("\n</tools>\n\n")
-                .append("## How to call tools\n")
-                .append("When you need a tool, output EXACTLY this format, and write nothing after it:\n")
+                .append("## How to call tools (the ONLY accepted format)\n")
+                .append("To call tools, write one <tool_calls> block. Inside it put a JSON ARRAY. ")
+                .append("Each element of the array is ONE call: {\"name\": ..., \"arguments\": {...}}.\n\n")
+                .append("Example: one call\n")
                 .append("<tool_calls>\n")
-                .append("[{\"name\": \"TOOL_NAME\", \"arguments\": {\"param\": \"value\"}}]\n")
+                .append("[{\"name\": \"tool_a\", \"arguments\": {\"query\": \"hello\"}}]\n")
                 .append("</tool_calls>\n\n")
+                .append("Example: several calls at once (parallel). Still ONE block, ONE array:\n")
+                .append("<tool_calls>\n")
+                .append("[{\"name\": \"tool_a\", \"arguments\": {\"query\": \"hello\"}}, ")
+                .append("{\"name\": \"tool_b\", \"arguments\": {\"id\": 42, \"verbose\": true}}]\n")
+                .append("</tool_calls>\n\n")
+                .append("Example: tool without parameters\n")
+                .append("<tool_calls>\n")
+                .append("[{\"name\": \"tool_c\", \"arguments\": {}}]\n")
+                .append("</tool_calls>\n\n")
+                .append("(tool_a / tool_b / tool_c are placeholders. Use the real names from <tools>.)\n\n")
                 .append("Rules:\n")
-                .append("- The text between the tags MUST be a valid JSON array.\n")
-                .append("- \"arguments\" MUST be a JSON object that matches the tool's \"parameters\" schema.\n")
-                .append("- To call several tools at once, put several objects in the same array.\n")
-                .append("- Never invent or guess tool results. After calling, stop and wait; ")
+                .append("- Between the tags there must be ONLY a valid JSON array. No comments, no extra text.\n")
+                .append("- \"arguments\" is always a JSON object with ALL parameters of that call inside it. ")
+                .append("It must match the tool's \"parameters\" schema.\n")
+                .append("- Parallel calls: all calls go in the SAME array of ONE <tool_calls> block. ")
+                .append("Never write several blocks.\n")
+                .append("- The <tool_calls> block must be the LAST thing in your reply. ")
+                .append("You may write one short sentence before it, nothing after it.\n")
+                .append("- Never invent or guess tool results. After calling, stop; ")
                 .append("results arrive as [TOOL RESULT] messages.\n")
-                .append("- Do NOT use any other format (no <tool_call>, no <arg>, no markdown code blocks).\n")
+                .append("- FORBIDDEN formats: DSML tags (<\uFF5CDSML\uFF5Cfunction_calls>, <\uFF5CDSML\uFF5Cinvoke>, ")
+                .append("<\uFF5CDSML\uFF5Cparameter>), <function_calls>, <invoke>, <parameter>, <tool_call>, <arg>, ")
+                .append("and markdown code blocks. Only <tool_calls>[...]</tool_calls> works.\n")
+                .append("- If you say you will do something that needs a tool, call the tool in the same reply.\n")
                 .append("- If no tool is needed, answer normally in plain text without the tags.\n");
 
         if ("required".equals(toolChoice) || "any".equals(toolChoice)) {
@@ -284,6 +303,12 @@ public final class OpenAIResponse {
                 .append("without any role label or prefix.\n\n");
         for (String[] r : list) {
             sb.append('[').append(r[0]).append("]\n").append(r[1]).append("\n\n");
+        }
+        if (hasTools) {
+            // Lambe conversation mein format bhoolta hai, isliye end mein yaad dilao
+            sb.append("(Reminder: to call tools reply with <tool_calls>[{\"name\": \"...\", \"arguments\": {...}}]")
+                    .append("</tool_calls> — several calls = several objects in the same array. ")
+                    .append("No DSML / <invoke> / <parameter> tags.)\n\n");
         }
         sb.append("[ASSISTANT]\n");
         return sb.toString();

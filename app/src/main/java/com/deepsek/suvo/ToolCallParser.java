@@ -20,6 +20,13 @@ import java.util.regex.Pattern;
  *   </tool_calls>
  *
  * Lenient fallbacks (model kabhi apna format bana de):
+ *   DeepSeek native DSML:
+ *     <|DSML|function_calls>
+ *     <|DSML|invoke name="x">
+ *     <|DSML|parameter name="k" string="true">v</|DSML|parameter>
+ *     </|DSML|invoke>
+ *     </|DSML|function_calls>
+ *     (invoke ke andar seedha JSON ho, ya tags toote hon, tab bhi)
  *   <tool_call>{"name": "...", "arguments": {...}}</tool_call>
  *   <tool_call>list_tools<arg name="x">value</arg></tool_call>
  *   ```json {"name": "...", "arguments": {...}} ```   (sirf known tool name ho tab)
@@ -49,6 +56,12 @@ public final class ToolCallParser {
     private static final Pattern FENCE = Pattern.compile(
             "^```[a-zA-Z_]*\\s*(.*?)\\s*```$", Pattern.DOTALL);
 
+    /** DSML tag: <|DSML|invoke name="x">, </||DSML||parameter>, < | DSML | calls> ... (| pehle | mein normalize) */
+    private static final Pattern DSML_TAG = Pattern.compile(
+            "<\\s*(/?)\\s*\\|[\\s|]*DSML[\\s|]*([a-zA-Z_]+)([^>]*)>", Pattern.CASE_INSENSITIVE);
+    private static final Pattern ATTR_NAME = Pattern.compile("name\\s*=\\s*[\"']([^\"']*)[\"']");
+    private static final Pattern ATTR_STRING = Pattern.compile("string\\s*=\\s*[\"']true[\"']", Pattern.CASE_INSENSITIVE);
+
     private ToolCallParser() {
     }
 
@@ -72,7 +85,11 @@ public final class ToolCallParser {
             return calls.length() > 0 ? new Result(rest.toString().trim(), calls) : new Result(text, calls);
         }
 
-        // 2. <tool_call>...</tool_call> (JSON ya <arg> format)
+        // 2. DeepSeek DSML format
+        Result dsml = parseDsml(text);
+        if (dsml != null) return dsml;
+
+        // 3. <tool_call>...</tool_call> (JSON ya <arg> format)
         rest.setLength(0);
         m = SINGLE.matcher(text);
         last = 0;
@@ -92,7 +109,7 @@ public final class ToolCallParser {
             return calls.length() > 0 ? new Result(rest.toString().trim(), calls) : new Result(text, calls);
         }
 
-        // 3. Poora reply sirf JSON / ```json block ho aur tool name known ho
+        // 4. Poora reply sirf JSON / ```json block ho aur tool name known ho
         String t = text.trim();
         Matcher f = FENCE.matcher(t);
         String json = f.matches() ? f.group(1).trim() : t;
@@ -103,6 +120,88 @@ public final class ToolCallParser {
         }
 
         return new Result(text, calls);
+    }
+
+    /* ---------------------------------------------------------------- DSML format */
+
+    /** DSML tags na milen ya koi invoke na ho toh null. */
+    private static Result parseDsml(String original) {
+        // Fullwidth | (U+FF5C) -> |  (ek char -> ek char, indexes same rehte hain)
+        String text = original.replace('\uFF5C', '|');
+        Matcher m = DSML_TAG.matcher(text);
+
+        JSONArray calls = new JSONArray();
+        int firstTag = -1, lastTag = -1;
+
+        String callName = null;
+        JSONObject callArgs = null;
+        int bodyStart = 0;
+        String paramName = null;
+        boolean paramIsString = false;
+        int paramStart = 0;
+
+        while (m.find()) {
+            if (firstTag < 0) firstTag = m.start();
+            lastTag = m.end();
+            boolean closing = "/".equals(m.group(1));
+            String tag = m.group(2).toLowerCase(Locale.ROOT);
+            String attrs = m.group(3);
+
+            if ("invoke".equals(tag)) {
+                if (!closing) {
+                    if (callName != null) finishDsmlCall(text, callName, callArgs, bodyStart, m.start(), calls);
+                    Matcher n = ATTR_NAME.matcher(attrs);
+                    callName = n.find() ? n.group(1).trim() : "";
+                    callArgs = new JSONObject();
+                    bodyStart = m.end();
+                    paramName = null;
+                } else if (callName != null) {
+                    finishDsmlCall(text, callName, callArgs, bodyStart, m.start(), calls);
+                    callName = null;
+                    callArgs = null;
+                }
+            } else if ("parameter".equals(tag)) {
+                if (!closing) {
+                    Matcher n = ATTR_NAME.matcher(attrs);
+                    paramName = n.find() ? n.group(1).trim() : "";
+                    paramIsString = ATTR_STRING.matcher(attrs).find();
+                    paramStart = m.end();
+                } else if (paramName != null && callArgs != null) {
+                    String raw = text.substring(paramStart, m.start()).trim();
+                    if (!paramName.isEmpty()) {
+                        try {
+                            callArgs.put(paramName, paramIsString ? raw : scalar(raw));
+                        } catch (JSONException ignored) {
+                        }
+                    }
+                    paramName = null;
+                }
+                // Akela closing </parameter> (bina opening ke) ignore
+            }
+            // function_calls / calls / tool_calls container tags sirf position ke liye
+        }
+
+        if (firstTag < 0) return null;
+        if (callName != null) finishDsmlCall(text, callName, callArgs, bodyStart, text.length(), calls);
+        if (calls.length() == 0) return null;
+
+        String content = (original.substring(0, firstTag) + original.substring(lastTag)).trim();
+        return new Result(content, calls);
+    }
+
+    private static void finishDsmlCall(String text, String name, JSONObject args, int bodyStart, int bodyEnd,
+                                       JSONArray out) {
+        if (name == null || name.isEmpty()) return;
+        if (args == null) args = new JSONObject();
+        if (args.length() == 0) {
+            // invoke ke andar parameters nahi, seedha JSON likha hai
+            String raw = DSML_TAG.matcher(text.substring(bodyStart, Math.max(bodyStart, bodyEnd))).replaceAll("").trim();
+            if (!raw.isEmpty()) {
+                out.put(makeCall(name, argsToString(raw)));
+                return;
+            }
+        }
+        out.put(makeCall(name, args.toString()));
     }
 
     /* ---------------------------------------------------------------- JSON format */
@@ -258,12 +357,13 @@ public final class ToolCallParser {
     /* ---------------------------------------------------------------- streaming */
 
     /**
-     * Stream ke time text aage bhejta hai, lekin "<tool_call" dikhte hi rok deta hai,
+     * Stream ke time text aage bhejta hai, lekin tool-call marker dikhte hi rok deta hai,
      * taaki tool block client ko content ki tarah leak na ho. Chunk ke end mein agar
-     * marker adhoora ho ("<too"), utna hissa next chunk tak hold karta hai.
+     * marker adhoora ho ("<too", "<"), utna hissa next chunk tak hold karta hai.
+     * "<|" / "<|" = DeepSeek ke special/DSML tags.
      */
     public static final class StreamFilter {
-        private static final String[] MARKERS = {"<tool_call", "<function_call"};
+        private static final String[] MARKERS = {"<tool_call", "<function_call", "<|", "<\uFF5C"};
 
         private final StringBuilder pending = new StringBuilder();
         private boolean capturing = false;
