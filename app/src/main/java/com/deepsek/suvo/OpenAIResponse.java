@@ -453,14 +453,23 @@ public final class OpenAIResponse {
                 JSONObject c = toolCalls.optJSONObject(i);
                 if (c == null) continue;
                 JSONObject fn = c.optJSONObject("function");
-                if (i > 0) sb.append(',');
-                sb.append(fn != null ? fn.optString("name") : c.optString("name"));
+                if (fn == null) fn = c;
+                if (i > 0) sb.append('|');
+                Object args = fn.opt("arguments");
+                sb.append(fn.optString("name")).append('(')
+                        .append(alnum(args == null ? "" : String.valueOf(args), 60)).append(')');
             }
             return sb.toString();
         }
-        String t = content == null ? "" : content.replaceAll("\\s+", " ").trim().toLowerCase(Locale.ROOT);
-        if (t.isEmpty()) return null;
-        return "tx:" + (t.length() > 160 ? t.substring(0, 160) : t);
+        // Sirf letters/digits: markdown, spaces, punctuation ka farak ignore
+        String t = alnum(content, 120);
+        return t.isEmpty() ? null : "tx:" + t;
+    }
+
+    private static String alnum(String s, int max) {
+        if (s == null) return "";
+        String t = s.toLowerCase(Locale.ROOT).replaceAll("[^\\p{L}\\p{N}]+", "");
+        return t.length() > max ? t.substring(0, max) : t;
     }
 
     private static int lastAssistantIndex(JSONArray messages) {

@@ -46,7 +46,9 @@ public final class ChatJob {
     private final StringBuilder content = new StringBuilder();
     private final StringBuilder reasoning = new StringBuilder();
     private final CountDownLatch startLatch = new CountDownLatch(1);
-    private final CountDownLatch endLatch = new CountDownLatch(1);
+    // Continue ke baad dobara wait karna padta hai, isliye ye latches reset ho sakte hain
+    private volatile CountDownLatch endLatch = new CountDownLatch(1);
+    private volatile CountDownLatch restartLatch = new CountDownLatch(1);
     private final CountDownLatch closedLatch = new CountDownLatch(1);
 
     public volatile boolean cancelled = false;
@@ -85,6 +87,28 @@ public final class ChatJob {
     }
 
     /* ------------------------------------------------ bridge se (JavaBridge thread) */
+
+    /** Bridge onStart: pehli baar = start, baad mein = continue wali stream shuru hui. */
+    public void onStreamStart() {
+        if (!started) markStarted();
+        else {
+            touch();
+            restartLatch.countDown();
+        }
+    }
+
+    /** Continue click se pehle: naye stream ke liye end/restart latches reset. */
+    public synchronized void prepareContinue() {
+        if (closed) return;
+        endReason = null;
+        endError = null;
+        endLatch = new CountDownLatch(1);
+        restartLatch = new CountDownLatch(1);
+    }
+
+    public boolean awaitRestart(long ms) throws InterruptedException {
+        return restartLatch.await(ms, TimeUnit.MILLISECONDS);
+    }
 
     public synchronized void markStarted() {
         if (started || closed) return;
@@ -131,6 +155,7 @@ public final class ChatJob {
     private void release() {
         startLatch.countDown();
         endLatch.countDown();
+        restartLatch.countDown();
         closedLatch.countDown();
     }
 

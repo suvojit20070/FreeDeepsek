@@ -8,6 +8,9 @@ import android.webkit.WebView;
 import org.json.JSONObject;
 import org.json.JSONTokener;
 
+import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
@@ -25,6 +28,7 @@ public final class DeepSeekAutomation {
     private static final long START_RETRY_MS = 10_000;
     private static final long IDLE_TIMEOUT_MS = 180_000;
     private static final long UPLOAD_TIMEOUT_MS = 120_000;
+    private static final int MAX_CONTINUES = 3;
     private static final long MAX_JOB_MS = 25 * 60_000;
 
     private final Context app;
@@ -33,8 +37,10 @@ public final class DeepSeekAutomation {
     private volatile String navToken;
     /** Same-chat mode: abhi wali DeepSeek chat ka session id. */
     private volatile String curSid;
-    /** Same-chat mode: humare pichhle reply ka fingerprint. */
-    private volatile String lastFp;
+    /** Same-chat mode: reply fingerprint -> DeepSeek chat (insertion order = sabse purana pehle). */
+    private final LinkedHashMap<String, Session> sessions = new LinkedHashMap<>();
+    private static final int MAX_SESSIONS = 20;
+    private static final long SESSION_IDLE_MS = 30 * 60_000L;
 
     public DeepSeekAutomation(Context app) {
         this.app = app.getApplicationContext();
@@ -42,33 +48,45 @@ public final class DeepSeekAutomation {
 
     public void run(ChatJob job) throws InterruptedException {
         boolean same = Config.sameChat(app);
-        // Continue tabhi jab client ka aakhri assistant message humara pichhla reply hi ho
-        boolean cont = same && curSid != null && job.followUp != null
-                && job.lastAssistantFp != null && job.lastAssistantFp.equals(lastFp);
+        if (!same && !sessions.isEmpty()) dropAllSessions();   // mode badla
+        if (same) expireSessions();
 
-        if (curSid != null && (!same || !cont)) {
-            // Conversation badli ya mode badla: purani chat chhodo
-            if (same && Config.deleteChats(app)) {
-                AppState.log("Conversation changed, old chat delete");
-                waitDelete("sid:" + curSid,
-                        unquote(eval("__fds.deleteSid(" + JSONObject.quote(curSid) + ")", 4000)));
+        // Har conversation ka apna DeepSeek chat: client ke aakhri assistant msg ka fingerprint = key
+        Session s = null;
+        boolean cont = false;
+        if (same) {
+            if (job.lastAssistantFp == null) {
+                AppState.log("New chat: request mein pichhla assistant message nahi (nayi conversation)");
+            } else if ((s = sessions.remove(job.lastAssistantFp)) == null) {
+                AppState.log("New chat: history kisi saved chat se match nahi hui ["
+                        + shorten(job.lastAssistantFp) + "] · saved " + sessions.size());
+            } else if (job.followUp == null) {
+                AppState.log("New chat: follow-up khaali");
+                sessions.put(job.lastAssistantFp, s);
+                s = null;
+            } else {
+                cont = true;
+                curSid = s.sid;
             }
-            curSid = null;
-            lastFp = null;
         }
 
         try {
             runSteps(job, cont);
         } finally {
             if (same) {
-                // Chat zinda rakho; agli request ke liye session + reply fingerprint yaad rakho
-                if (job.isStarted()) {
-                    String sid = unquote(eval("__fds.lastSession()", 3000));
-                    if (!sid.isEmpty()) curSid = sid;
+                // Chat zinda rakho; is reply ke fingerprint se session save karo
+                String sid = job.isStarted() ? unquote(eval("__fds.lastSession()", 3000)) : "";
+                if (!sid.isEmpty()) {
                     ToolCallParser.Result r = ToolCallParser.parse(job.content(), null);
-                    lastFp = r.hasCalls()
+                    String fp = r.hasCalls()
                             ? OpenAIResponse.fingerprint(r.content, r.toolCalls)
                             : OpenAIResponse.fingerprint(job.content(), null);
+                    if (fp != null) {
+                        sessions.put(fp, new Session(sid));
+                        trimSessions();
+                    }
+                } else if (s != null) {
+                    sessions.put(job.lastAssistantFp, s); // request gayi hi nahi: purana session wapas
                 }
             } else {
                 // Request DeepSeek tak gayi thi -> account mein chat bani -> delete karo
@@ -77,6 +95,63 @@ public final class DeepSeekAutomation {
                 prewarm();
             }
         }
+    }
+
+    /* ---------------------------------------------------------------- same-chat sessions */
+
+    private static final class Session {
+        final String sid;
+        final long lastUsed = System.currentTimeMillis();
+
+        Session(String sid) {
+            this.sid = sid;
+        }
+    }
+
+    private static String shorten(String fp) {
+        return fp.length() > 40 ? fp.substring(0, 40) + "…" : fp;
+    }
+
+    private boolean sidInUse(String sid) {
+        for (Session x : sessions.values()) if (x.sid.equals(sid)) return true;
+        return false;
+    }
+
+    private void deleteSid(String sid) throws InterruptedException {
+        if (!Config.deleteChats(app) || sidInUse(sid)) return;
+        waitDelete("sid:" + sid, unquote(eval("__fds.deleteSid(" + JSONObject.quote(sid) + ")", 4000)));
+    }
+
+    /** MAX_SESSIONS se zyada ho toh sabse purane delete. */
+    private void trimSessions() throws InterruptedException {
+        while (sessions.size() > MAX_SESSIONS) {
+            Iterator<Map.Entry<String, Session>> it = sessions.entrySet().iterator();
+            Session old = it.next().getValue();
+            it.remove();
+            deleteSid(old.sid);
+        }
+    }
+
+    /** SESSION_IDLE_MS se purane sessions delete. */
+    private void expireSessions() throws InterruptedException {
+        long now = System.currentTimeMillis();
+        Iterator<Map.Entry<String, Session>> it = sessions.entrySet().iterator();
+        java.util.List<String> dead = new java.util.ArrayList<>();
+        while (it.hasNext()) {
+            Session x = it.next().getValue();
+            if (now - x.lastUsed > SESSION_IDLE_MS) {
+                it.remove();
+                dead.add(x.sid);
+            }
+        }
+        for (String sid : dead) deleteSid(sid);
+    }
+
+    private void dropAllSessions() throws InterruptedException {
+        java.util.List<String> all = new java.util.ArrayList<>();
+        for (Session x : sessions.values()) all.add(x.sid);
+        sessions.clear();
+        for (String sid : all) deleteSid(sid);
     }
 
     /** loadUrl ke saath navigation token, taaki waitReady purane page ko "ready" na samjhe. */
@@ -231,6 +306,40 @@ public final class DeepSeekAutomation {
             }
         }
         if (job.isClosed()) return;
+
+        // 6b. DeepSeek ne beech mein roka (INCOMPLETE / Continue button) -> Continue click, max 3 baar
+        for (int round = 1; round <= MAX_CONTINUES && !job.isClosed() && !job.cancelled; round++) {
+            boolean incomplete = "incomplete".equals(job.endReason());
+            String has = "no";
+            // INCOMPLETE mila ho toh button render hone ka thoda wait, warna ek quick check
+            long until = System.currentTimeMillis() + (incomplete ? 2500 : 0);
+            do {
+                has = unquote(eval("__fds.hasContinue()", 2000));
+                if ("yes".equals(has) || System.currentTimeMillis() >= until) break;
+                Thread.sleep(250);
+            } while (true);
+            if (!"yes".equals(has)) break;
+
+            job.prepareContinue();
+            String c = unquote(eval("__fds.continueGen(" + JSONObject.quote(job.id) + ")", 3000));
+            AppState.log("Continue #" + round + ": " + c);
+            if (!"clicked".equals(c) || !job.awaitRestart(15_000)) {
+                AppState.log("Continue stream start nahi hui");
+                break;
+            }
+            long cBegin = System.currentTimeMillis();
+            while (!job.awaitEnd(1000)) {
+                long now = System.currentTimeMillis();
+                if (job.cancelled || now - job.lastActivity() > IDLE_TIMEOUT_MS || now - cBegin > MAX_JOB_MS) break;
+            }
+            if (job.cancelled) {
+                eval("__fds.stop()", 3000);
+                job.finish("stop");
+                return;
+            }
+        }
+        if (job.isClosed()) return;
+        if ("incomplete".equals(job.endReason())) finish = "length";
 
         // 7. Stream se kuch nahi mila toh DOM se last answer (fallback)
         if (job.isEmpty()) {

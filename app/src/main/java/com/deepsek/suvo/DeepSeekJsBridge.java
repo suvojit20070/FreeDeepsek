@@ -9,8 +9,9 @@ public final class DeepSeekJsBridge {
     public void onStart(String id) {
         ChatJob job = RequestQueue.get().find(id);
         if (job != null) {
-            job.markStarted();
-            AppState.log("Response stream started");
+            boolean first = !job.isStarted();
+            job.onStreamStart();
+            AppState.log(first ? "Response stream started" : "Continue stream started");
         }
     }
 

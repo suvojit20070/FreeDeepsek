@@ -11,7 +11,7 @@
   if (window.__fds && window.__fds.__v) return;
 
   var VERSION = 1;
-  var COMPLETION_RE = /\/chat\/completion(\?|$|#)/i;
+  var COMPLETION_RE = /\/chat\/(completion|continue|resume|regenerate)(\?|$|#)/i;
   // activeId: jo request bhejni hai; req: id -> {headers, sid} (chat delete ke liye); del: delete status
   var S = { activeId: null, req: {}, del: {}, lastSid: '', lastHeaders: null };
   // File upload tracking
@@ -142,7 +142,14 @@
    *  3. Purana patch:  {"p":"response/thinking_content","v":".."} / "response/content"
    */
   function makeParser(id) {
-    var buf = '', lastPath = '', frags = [], got = false, ended = false, errMsg = '', curEvent = '', fin = false;
+    var buf = '', lastPath = '', frags = [], got = false, ended = false, errMsg = '', curEvent = '', fin = false, incomplete = false;
+
+    // INCOMPLETE = DeepSeek ne beech mein roka (Continue button aata hai)
+    function status(v) {
+      v = String(v || '').toUpperCase();
+      if (v.indexOf('INCOMPLETE') >= 0) { incomplete = true; fin = true; }
+      else if (/^(FINISHED|DONE|COMPLETED?)$/.test(v)) fin = true;
+    }
 
     function fragKind(i) {
       if (i < 0) i = frags.length + i;
@@ -181,7 +188,7 @@
       if (Array.isArray(r.fragments)) addFrags(r.fragments);
       if (typeof r.thinking_content === 'string') emit('think', r.thinking_content);
       if (typeof r.content === 'string') emit('text', r.content);
-      if (r.status && /FINISHED|DONE|COMPLETE/i.test(String(r.status))) fin = true;
+      if (r.status) status(r.status);
     }
 
     function handle(o, base) {
@@ -220,7 +227,7 @@
 
       if (typeof v === 'string') {
         var path = p || lastPath;
-        if (/status$/.test(path)) { if (/FINISHED|DONE|COMPLETE/i.test(v)) fin = true; return; }
+        if (/status$/.test(path)) { status(v); return; }
         emit(pathKind(path), v);
         return;
       }
@@ -273,6 +280,7 @@
         ended = true;
         if (buf.trim()) { line(buf.trim()); buf = ''; }
         if (err) errMsg = errMsg || err;
+        if (incomplete && (!reason || reason === 'stop')) reason = 'incomplete';
         call('onEnd', id, reason || 'stop', got ? '' : errMsg);
       }
     };
@@ -511,6 +519,17 @@
     return /disabled/i.test(String(cls || ''));
   }
 
+  var CONTINUE_WORDS = ['continue', 'continue generating', '继续', '继续生成'];
+
+  function findContinue() {
+    var list = document.querySelectorAll('button,[role="button"]');
+    for (var i = list.length - 1; i >= 0; i--) {
+      var t = (list[i].innerText || '').trim().toLowerCase();
+      if (t && t.length <= 25 && CONTINUE_WORDS.indexOf(t) >= 0 && !isDisabled(list[i])) return list[i];
+    }
+    return null;
+  }
+
   function clickSendIfPending() {
     var input = findInput();
     if (!input) return 'noinput';
@@ -643,6 +662,15 @@
       return (sid && location.pathname.indexOf(sid) >= 0 && ready() === 'ready') ? 'yes' : 'no';
     },
     deleteState: function (id) { return S.del[id] || 'none'; },
+    /* DeepSeek ka "Continue" button (response beech mein ruka ho tab aata hai) */
+    hasContinue: function () { return findContinue() ? 'yes' : 'no'; },
+    continueGen: function (id) {
+      var b = findContinue();
+      if (!b) return 'nobutton';
+      S.activeId = id; // continue wali stream bhi isi request ki hai
+      clickEl(b);
+      return 'clicked';
+    },
     /* Khaali home page (naya chat) par hain? Pre-warm check */
     isFresh: function () {
       if (ready() !== 'ready') return 'no';
