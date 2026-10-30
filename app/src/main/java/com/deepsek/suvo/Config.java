@@ -39,14 +39,20 @@ public final class Config {
         return prefs(c).getBoolean("delete_chats", true);
     }
 
+    /** true = har request naya chat nahi; DeepSeek ke usi chat mein conversation aage badhao. */
+    public static boolean sameChat(Context c) {
+        return prefs(c).getBoolean("same_chat", false);
+    }
+
     public static void save(Context c, int port, boolean allowLan, String apiKey, boolean keepAlive,
-                            boolean deleteChats) {
+                            boolean deleteChats, boolean sameChat) {
         prefs(c).edit()
                 .putInt("port", port)
                 .putBoolean("allow_lan", allowLan)
                 .putString("api_key", apiKey == null ? "" : apiKey.trim())
                 .putBoolean("keep_alive", keepAlive)
                 .putBoolean("delete_chats", deleteChats)
+                .putBoolean("same_chat", sameChat)
                 .apply();
     }
 }

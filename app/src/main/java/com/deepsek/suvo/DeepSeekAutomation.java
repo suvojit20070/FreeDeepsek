@@ -31,20 +31,70 @@ public final class DeepSeekAutomation {
     private final Handler main = new Handler(Looper.getMainLooper());
     /** Reload se pehle purane page par set kiya token; naya page aane tak "old" milega. */
     private volatile String navToken;
+    /** Same-chat mode: abhi wali DeepSeek chat ka session id. */
+    private volatile String curSid;
+    /** Same-chat mode: humare pichhle reply ka fingerprint. */
+    private volatile String lastFp;
 
     public DeepSeekAutomation(Context app) {
         this.app = app.getApplicationContext();
     }
 
     public void run(ChatJob job) throws InterruptedException {
-        try {
-            runSteps(job);
-        } finally {
-            // Request DeepSeek tak gayi thi -> account mein chat bani -> delete karo
-            if (job.isStarted() && Config.deleteChats(app)) deleteChat(job);
-            // Agli request ke liye fresh page abhi se load kar do (pre-warm)
-            prewarm();
+        boolean same = Config.sameChat(app);
+        // Continue tabhi jab client ka aakhri assistant message humara pichhla reply hi ho
+        boolean cont = same && curSid != null && job.followUp != null
+                && job.lastAssistantFp != null && job.lastAssistantFp.equals(lastFp);
+
+        if (curSid != null && (!same || !cont)) {
+            // Conversation badli ya mode badla: purani chat chhodo
+            if (same && Config.deleteChats(app)) {
+                AppState.log("Conversation changed, old chat delete");
+                waitDelete("sid:" + curSid,
+                        unquote(eval("__fds.deleteSid(" + JSONObject.quote(curSid) + ")", 4000)));
+            }
+            curSid = null;
+            lastFp = null;
         }
+
+        try {
+            runSteps(job, cont);
+        } finally {
+            if (same) {
+                // Chat zinda rakho; agli request ke liye session + reply fingerprint yaad rakho
+                if (job.isStarted()) {
+                    String sid = unquote(eval("__fds.lastSession()", 3000));
+                    if (!sid.isEmpty()) curSid = sid;
+                    ToolCallParser.Result r = ToolCallParser.parse(job.content(), null);
+                    lastFp = r.hasCalls()
+                            ? OpenAIResponse.fingerprint(r.content, r.toolCalls)
+                            : OpenAIResponse.fingerprint(job.content(), null);
+                }
+            } else {
+                // Request DeepSeek tak gayi thi -> account mein chat bani -> delete karo
+                if (job.isStarted() && Config.deleteChats(app)) deleteChat(job);
+                // Agli request ke liye fresh page abhi se load kar do (pre-warm)
+                prewarm();
+            }
+        }
+    }
+
+    /** loadUrl ke saath navigation token, taaki waitReady purane page ko "ready" na samjhe. */
+    private void navigate(String url) throws InterruptedException {
+        String token = "n" + System.nanoTime();
+        evalRaw("window.__fdsNav=" + JSONObject.quote(token) + ";", 2000);
+        CountDownLatch loaded = new CountDownLatch(1);
+        main.post(() -> {
+            try {
+                WebView w = WebViewManager.get().obtain(app);
+                w.stopLoading();
+                w.loadUrl(url);
+            } finally {
+                loaded.countDown();
+            }
+        });
+        loaded.await(5, TimeUnit.SECONDS);
+        navToken = token;
     }
 
     /** Next request ke liye home page background mein load kar do. */
@@ -55,32 +105,34 @@ public final class DeepSeekAutomation {
         });
     }
 
-    private void runSteps(ChatJob job) throws InterruptedException {
+    private void runSteps(ChatJob job, boolean cont) throws InterruptedException {
         long t0 = System.currentTimeMillis();
-
-        // 1. Fresh chat: pre-warmed page pehle se khaali home par ho toh reload skip
-        String fresh = unquote(eval("window.__fds ? __fds.isFresh() : 'no'", 3000));
+        String prompt = cont ? job.followUp : job.prompt;
         boolean reloaded = false;
-        if (!"yes".equals(fresh)) {
-            AppState.log("New chat (reload) for " + job.id.substring(0, 8));
-            String token = "n" + System.nanoTime();
-            evalRaw("window.__fdsNav=" + JSONObject.quote(token) + ";", 2000);
-            CountDownLatch loaded = new CountDownLatch(1);
-            main.post(() -> {
-                try {
-                    WebView w = WebViewManager.get().obtain(app);
-                    w.stopLoading();
-                    w.loadUrl(HOME_URL);
-                } finally {
-                    loaded.countDown();
-                }
-            });
-            loaded.await(5, TimeUnit.SECONDS);
-            reloaded = true;
-            navToken = token;
+
+        if (cont) {
+            // 1a. Same chat: page pehle se usi chat par ho toh seedha bhejo, warna chat kholo
+            String sid = curSid;
+            String on = unquote(eval("window.__fds ? __fds.onChat(" + JSONObject.quote(sid) + ") : 'no'", 3000));
+            if ("yes".equals(on)) {
+                navToken = null;
+                AppState.log("Same chat (follow-up only) for " + job.id.substring(0, 8));
+            } else {
+                AppState.log("Same chat (reopen) for " + job.id.substring(0, 8));
+                navigate(HOME_URL + "a/chat/s/" + sid);
+                reloaded = true;
+            }
         } else {
-            navToken = null;
-            AppState.log("New chat (pre-warmed) for " + job.id.substring(0, 8));
+            // 1b. Fresh chat: pre-warmed page pehle se khaali home par ho toh reload skip
+            String fresh = unquote(eval("window.__fds ? __fds.isFresh() : 'no'", 3000));
+            if ("yes".equals(fresh)) {
+                navToken = null;
+                AppState.log("New chat (pre-warmed) for " + job.id.substring(0, 8));
+            } else {
+                AppState.log("New chat (reload) for " + job.id.substring(0, 8));
+                navigate(HOME_URL);
+                reloaded = true;
+            }
         }
 
         // 2. Page ready?
@@ -124,7 +176,7 @@ public final class DeepSeekAutomation {
 
         // 4. Prompt insert, phir Enter (JS timers nahi: background mein throttle hote hain)
         String filled = unquote(eval("__fds.fill(" + JSONObject.quote(job.id) + ","
-                + JSONObject.quote(job.prompt) + ")", 10_000));
+                + JSONObject.quote(prompt) + ")", 10_000));
         if (!"ok".equals(filled)) {
             job.fail("Prompt insert failed: " + (filled.isEmpty() ? "no result" : filled));
             return;
@@ -229,15 +281,19 @@ public final class DeepSeekAutomation {
     }
 
     private void deleteChat(ChatJob job) throws InterruptedException {
-        String r = unquote(eval("__fds.deleteChat(" + JSONObject.quote(job.id) + ")", 4000));
-        if (!"started".equals(r)) {
-            AppState.log("Chat delete skipped: " + r);
+        waitDelete(job.id, unquote(eval("__fds.deleteChat(" + JSONObject.quote(job.id) + ")", 4000)));
+    }
+
+    /** startResult = JS deleteChat/deleteSid ka return; "started" ho toh result ka wait. */
+    private void waitDelete(String key, String startResult) throws InterruptedException {
+        if (!"started".equals(startResult)) {
+            AppState.log("Chat delete skipped: " + startResult);
             return;
         }
         long deadline = System.currentTimeMillis() + 8000;
         String st = "pending";
         while (System.currentTimeMillis() < deadline) {
-            st = unquote(eval("__fds.deleteState(" + JSONObject.quote(job.id) + ")", 3000));
+            st = unquote(eval("__fds.deleteState(" + JSONObject.quote(key) + ")", 3000));
             if (!"pending".equals(st)) break;
             Thread.sleep(300);
         }

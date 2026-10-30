@@ -13,7 +13,7 @@
   var VERSION = 1;
   var COMPLETION_RE = /\/chat\/completion(\?|$|#)/i;
   // activeId: jo request bhejni hai; req: id -> {headers, sid} (chat delete ke liye); del: delete status
-  var S = { activeId: null, req: {}, del: {} };
+  var S = { activeId: null, req: {}, del: {}, lastSid: '', lastHeaders: null };
   // File upload tracking
   var U = { expected: 0, done: 0, pending: 0, failed: '', last: 0, t0: 0, statuses: [] };
 
@@ -59,6 +59,48 @@
       }
     } catch (e) { /* ignore */ }
     return h;
+  }
+
+  function remember(id, info) {
+    S.req[id] = info;
+    if (info.sid) S.lastSid = info.sid;
+    if (info.headers && Object.keys(info.headers).length) S.lastHeaders = info.headers;
+  }
+
+  function sidFromUrl() {
+    var m = /\/chat\/s\/([0-9a-zA-Z-]{8,})/.exec(location.pathname);
+    return m ? m[1] : '';
+  }
+
+  // Page ki auth headers ke saath chat_session/delete call
+  function doDelete(key, sid, headers) {
+    var h = {}, src = headers || {};
+    for (var k in src) {
+      var lk = k.toLowerCase();
+      if (lk.indexOf('pow') >= 0 || lk === 'content-length' || lk === 'accept') continue;
+      h[k] = src[k];
+    }
+    var hasAuth = Object.keys(h).some(function (k) { return k.toLowerCase() === 'authorization'; });
+    if (!hasAuth) {
+      try {
+        var t = JSON.parse(localStorage.getItem('userToken') || 'null');
+        var tok = t && (t.value || t);
+        if (typeof tok === 'string' && tok) h['authorization'] = 'Bearer ' + tok;
+      } catch (e) { /* ignore */ }
+    }
+    h['content-type'] = 'application/json';
+    S.del[key] = 'pending';
+    origFetch.call(window, location.origin + '/api/v0/chat_session/delete', {
+      method: 'POST', headers: h, credentials: 'include',
+      body: JSON.stringify({ chat_session_id: sid })
+    }).then(function (res) {
+      return res.text().then(function (t) {
+        var ok = res.ok;
+        try { var j = JSON.parse(t); if (typeof j.code === 'number' && j.code !== 0) ok = false; } catch (e) { /* ignore */ }
+        S.del[key] = ok ? 'ok' : 'fail:HTTP ' + res.status + ' ' + String(t).slice(0, 150);
+      });
+    }).catch(function (e) { S.del[key] = 'fail:' + e; });
+    return 'started';
   }
 
   function sessionFromBody(body) {
@@ -291,14 +333,14 @@
         sid: sessionFromBody(init && init.body)
       };
       var id = COMPLETION_RE.test(url) ? claim() : null;
-      if (id) S.req[id] = reqInfo;
+      if (id) remember(id, reqInfo);
       return promise.then(function (res) {
         try {
           var myId = id;
           // Endpoint ka naam badal gaya ho toh bhi: koi bhi POST jo SSE de, woh hamara hai
           if (!myId && S.activeId && isEventStream(res)) {
             myId = claim();
-            if (myId) S.req[myId] = reqInfo;
+            if (myId) remember(myId, reqInfo);
           }
           if (myId) handleFetchResponse(myId, res);
         } catch (e) { log('fetch hook: ' + e); }
@@ -344,7 +386,7 @@
       }
       if (S.activeId && String(x.__fdsM).toUpperCase() === 'POST' && COMPLETION_RE.test(x.__fdsU || '')) {
         var id = claim(), p = makeParser(id), off = 0;
-        S.req[id] = { headers: x.__fdsH || {}, sid: sessionFromBody(body) };
+        remember(id, { headers: x.__fdsH || {}, sid: sessionFromBody(body) });
         var pull = function () {
           try {
             var t = x.responseText || '';
@@ -585,39 +627,20 @@
     deleteChat: function (id) {
       var r = S.req[id] || {};
       delete S.req[id];
-      var sid = r.sid;
-      if (!sid) {
-        var m = /\/chat\/s\/([0-9a-zA-Z-]{8,})/.exec(location.pathname);
-        if (m) sid = m[1];
-      }
+      var sid = r.sid || sidFromUrl();
       if (!sid) { S.del[id] = 'fail:no session id'; return 'nosession'; }
-      var h = {}, src = r.headers || {};
-      for (var k in src) {
-        var lk = k.toLowerCase();
-        if (lk.indexOf('pow') >= 0 || lk === 'content-length' || lk === 'accept') continue;
-        h[k] = src[k];
-      }
-      var hasAuth = Object.keys(h).some(function (k) { return k.toLowerCase() === 'authorization'; });
-      if (!hasAuth) {
-        try {
-          var t = JSON.parse(localStorage.getItem('userToken') || 'null');
-          var tok = t && (t.value || t);
-          if (typeof tok === 'string' && tok) h['authorization'] = 'Bearer ' + tok;
-        } catch (e) { /* ignore */ }
-      }
-      h['content-type'] = 'application/json';
-      S.del[id] = 'pending';
-      origFetch.call(window, location.origin + '/api/v0/chat_session/delete', {
-        method: 'POST', headers: h, credentials: 'include',
-        body: JSON.stringify({ chat_session_id: sid })
-      }).then(function (res) {
-        return res.text().then(function (t) {
-          var ok = res.ok;
-          try { var j = JSON.parse(t); if (typeof j.code === 'number' && j.code !== 0) ok = false; } catch (e) { /* ignore */ }
-          S.del[id] = ok ? 'ok' : 'fail:HTTP ' + res.status + ' ' + String(t).slice(0, 150);
-        });
-      }).catch(function (e) { S.del[id] = 'fail:' + e; });
-      return 'started';
+      return doDelete(id, sid, r.headers || S.lastHeaders);
+    },
+    /* Same-chat mode: purani chat ko session id se delete */
+    deleteSid: function (sid) {
+      if (!sid) return 'nosession';
+      return doDelete('sid:' + sid, sid, S.lastHeaders);
+    },
+    /* Abhi wali request ka DeepSeek chat_session_id */
+    lastSession: function () { return S.lastSid || sidFromUrl(); },
+    /* Page abhi isi chat par hai aur input ready hai? */
+    onChat: function (sid) {
+      return (sid && location.pathname.indexOf(sid) >= 0 && ready() === 'ready') ? 'yes' : 'no';
     },
     deleteState: function (id) { return S.del[id] || 'none'; },
     /* Khaali home page (naya chat) par hain? Pre-warm check */

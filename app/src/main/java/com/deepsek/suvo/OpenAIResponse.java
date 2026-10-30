@@ -440,6 +440,99 @@ public final class OpenAIResponse {
         return sb.toString();
     }
 
+    /* ---------------------------------------------------------------- same-chat mode */
+
+    /**
+     * Reply ka chhota fingerprint: tool calls ho toh unke naam, warna normalized text ka shuru.
+     * Client ka aakhri assistant message humare pichhle reply se match hua toh hi same chat continue hota hai.
+     */
+    public static String fingerprint(String content, JSONArray toolCalls) {
+        if (toolCalls != null && toolCalls.length() > 0) {
+            StringBuilder sb = new StringBuilder("tc:");
+            for (int i = 0; i < toolCalls.length(); i++) {
+                JSONObject c = toolCalls.optJSONObject(i);
+                if (c == null) continue;
+                JSONObject fn = c.optJSONObject("function");
+                if (i > 0) sb.append(',');
+                sb.append(fn != null ? fn.optString("name") : c.optString("name"));
+            }
+            return sb.toString();
+        }
+        String t = content == null ? "" : content.replaceAll("\\s+", " ").trim().toLowerCase(Locale.ROOT);
+        if (t.isEmpty()) return null;
+        return "tx:" + (t.length() > 160 ? t.substring(0, 160) : t);
+    }
+
+    private static int lastAssistantIndex(JSONArray messages) {
+        for (int i = messages.length() - 1; i >= 0; i--) {
+            JSONObject m = messages.optJSONObject(i);
+            if (m != null && "assistant".equalsIgnoreCase(m.optString("role"))) return i;
+        }
+        return -1;
+    }
+
+    public static String lastAssistantFingerprint(JSONArray messages) {
+        int k = lastAssistantIndex(messages);
+        if (k < 0) return null;
+        JSONObject m = messages.optJSONObject(k);
+        return fingerprint(textOf(m.opt("content")), m.optJSONArray("tool_calls"));
+    }
+
+    /**
+     * Same chat mein bhejne wala sirf naya hissa: aakhri assistant message ke baad ke
+     * user / tool messages. Assistant message hi nahi (nayi conversation) toh null.
+     */
+    public static String buildFollowUp(JSONArray messages, JSONArray tools) {
+        int k = lastAssistantIndex(messages);
+        if (k < 0 || k == messages.length() - 1) return null;
+
+        Map<String, String> idToName = new HashMap<>();
+        renderAssistantCalls(messages.optJSONObject(k), idToName);
+
+        List<String[]> parts = new ArrayList<>();
+        boolean onlyUser = true;
+        for (int i = k + 1; i < messages.length(); i++) {
+            JSONObject m = messages.optJSONObject(i);
+            if (m == null) continue;
+            String role = m.optString("role", "user").toLowerCase(Locale.ROOT);
+            String text = textOf(m.opt("content")).trim();
+            String label;
+            if ("tool".equals(role) || "function".equals(role)) {
+                onlyUser = false;
+                String id = m.optString("tool_call_id", "");
+                String name = m.optString("name", "");
+                if (name.isEmpty() && idToName.containsKey(id)) name = idToName.get(id);
+                label = "TOOL RESULT" + (name.isEmpty() ? "" : ": " + name);
+                if (text.isEmpty()) text = "(empty result)";
+            } else if ("system".equals(role) || "developer".equals(role)) {
+                onlyUser = false;
+                label = "SYSTEM";
+            } else {
+                label = "USER";
+            }
+            if (text.isEmpty()) continue;
+            parts.add(new String[]{label, text});
+        }
+        if (parts.isEmpty()) return null;
+
+        boolean hasTools = tools != null && tools.length() > 0;
+        StringBuilder sb = new StringBuilder();
+        if (onlyUser && parts.size() == 1 && !hasTools) return parts.get(0)[1];
+        for (String[] r : parts) {
+            if (onlyUser && parts.size() == 1) {
+                sb.append(r[1]).append("\n\n");
+            } else {
+                sb.append('[').append(r[0]).append("]\n").append(r[1]).append("\n\n");
+            }
+        }
+        if (hasTools) {
+            sb.append("(Reminder: tools are the same as defined at the start of this chat. To call tools reply with ")
+                    .append("<tool_calls>[{\"name\": \"...\", \"arguments\": {...}}]</tool_calls> — several calls = ")
+                    .append("several objects in the same array.)");
+        }
+        return sb.toString().trim();
+    }
+
     /* ---------------------------------------------------------------- responses */
 
     public static JSONObject models() {

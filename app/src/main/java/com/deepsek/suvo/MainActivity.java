@@ -212,8 +212,13 @@ public class MainActivity extends Activity implements AppState.Listener {
         cbKeep.setChecked(Config.keepAlive(this));
         root.addView(cbKeep, marginParams());
 
+        CheckBox cbSame = new CheckBox(this);
+        cbSame.setText("Same chat continue karo (OFF = har request naya chat)");
+        cbSame.setChecked(Config.sameChat(this));
+        root.addView(cbSame, marginParams());
+
         CheckBox cbDelete = new CheckBox(this);
-        cbDelete.setText("Response ke baad DeepSeek chat delete karo");
+        cbDelete.setText("DeepSeek chat delete karo (naya mode: har response ke baad · same mode: chat badalne par)");
         cbDelete.setChecked(Config.deleteChats(this));
         LinearLayout.LayoutParams last = marginParams();
         last.bottomMargin = dp(12);
@@ -238,7 +243,7 @@ public class MainActivity extends Activity implements AppState.Listener {
                         Toast.makeText(this, "LAN on hai: API key set karna better hai", Toast.LENGTH_LONG).show();
                     }
                     Config.save(this, port, cbLan.isChecked(), etKey.getText().toString(), cbKeep.isChecked(),
-                            cbDelete.isChecked());
+                            cbDelete.isChecked(), cbSame.isChecked());
                     if (DeepSeekService.isRunning()) {
                         startService(new Intent(this, DeepSeekService.class)
                                 .setAction(DeepSeekService.ACTION_RESTART_SERVER));

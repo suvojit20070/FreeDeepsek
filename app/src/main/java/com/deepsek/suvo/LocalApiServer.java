@@ -274,7 +274,9 @@ public final class LocalApiServer {
         boolean includeUsage = so != null && so.optBoolean("include_usage", false);
 
         JSONArray files = OpenAIResponse.extractFiles(msgs);
-        ChatJob job = new ChatJob(prompt, model, think, search, stream, files);
+        String followUp = OpenAIResponse.buildFollowUp(msgs, tools);
+        String lastFp = OpenAIResponse.lastAssistantFingerprint(msgs);
+        ChatJob job = new ChatJob(prompt, model, think, search, stream, files, followUp, lastFp);
         AppState.log("API request · " + model + (stream ? " · stream" : "")
                 + (tools != null ? " · " + tools.length() + " tools" : "")
                 + (files.length() > 0 ? " · " + files.length() + " files" : ""));
