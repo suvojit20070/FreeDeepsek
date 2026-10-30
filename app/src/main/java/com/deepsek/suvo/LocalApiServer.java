@@ -273,9 +273,11 @@ public final class LocalApiServer {
         JSONObject so = body.optJSONObject("stream_options");
         boolean includeUsage = so != null && so.optBoolean("include_usage", false);
 
-        ChatJob job = new ChatJob(prompt, model, think, search, stream);
+        JSONArray files = OpenAIResponse.extractFiles(msgs);
+        ChatJob job = new ChatJob(prompt, model, think, search, stream, files);
         AppState.log("API request · " + model + (stream ? " · stream" : "")
-                + (tools != null ? " · " + tools.length() + " tools" : ""));
+                + (tools != null ? " · " + tools.length() + " tools" : "")
+                + (files.length() > 0 ? " · " + files.length() + " files" : ""));
         RequestQueue.get().submit(job);
 
         if (stream) streamResponse(job, out, includeUsage, tools != null ? toolNames : null);

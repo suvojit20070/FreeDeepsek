@@ -12,7 +12,59 @@
 
   var VERSION = 1;
   var COMPLETION_RE = /\/chat\/completion(\?|$|#)/i;
-  var S = { activeId: null };
+  // activeId: jo request bhejni hai; req: id -> {headers, sid} (chat delete ke liye); del: delete status
+  var S = { activeId: null, req: {}, del: {} };
+  // File upload tracking
+  var U = { expected: 0, done: 0, pending: 0, failed: '', last: 0, t0: 0, statuses: [] };
+
+  function isFileUrl(u) { return /\/file/i.test(u || ''); }
+
+  function noteFileResponse(text) {
+    U.last = Date.now();
+    try {
+      var found = String(text || '').match(/"status"\s*:\s*"([A-Za-z_]+)"/g) || [];
+      var st = found.map(function (x) { return x.replace(/.*"([A-Za-z_]+)"$/, '$1').toUpperCase(); });
+      if (st.length) U.statuses = st;
+      if (st.some(function (x) { return /FAIL|ERROR/.test(x); })) {
+        var mm = /"(?:msg|error_msg|message)"\s*:\s*"([^"]*)"/.exec(text);
+        U.failed = (mm && mm[1]) || 'upload failed';
+      }
+    } catch (e) { /* ignore */ }
+  }
+
+  function trackFilePromise(promise, url) {
+    var isUpload = /upload/i.test(url);
+    U.pending++;
+    U.last = Date.now();
+    promise.then(function (res) {
+      res.clone().text().then(function (t) {
+        noteFileResponse(t);
+        if (!res.ok) U.failed = U.failed || ('HTTP ' + res.status);
+        U.pending--;
+        if (isUpload) U.done++;
+      }, function () { U.pending--; if (isUpload) U.done++; });
+    }, function (e) { U.pending--; U.failed = 'network: ' + e; });
+  }
+
+  function headersToObject(src) {
+    var h = {};
+    if (!src) return h;
+    try {
+      if (typeof Headers !== 'undefined' && src instanceof Headers) {
+        src.forEach(function (v, k) { h[k] = v; });
+      } else if (Array.isArray(src)) {
+        src.forEach(function (p) { h[p[0]] = p[1]; });
+      } else {
+        for (var k in src) if (Object.prototype.hasOwnProperty.call(src, k)) h[k] = src[k];
+      }
+    } catch (e) { /* ignore */ }
+    return h;
+  }
+
+  function sessionFromBody(body) {
+    if (typeof body !== 'string') return '';
+    try { return JSON.parse(body).chat_session_id || ''; } catch (e) { return ''; }
+  }
 
   /* ---------------------------------------------------------------- bridge */
 
@@ -224,14 +276,23 @@
       } catch (e) { /* ignore */ }
 
       var promise = origFetch.apply(this, arguments);
+      if (U.expected && isFileUrl(url)) trackFilePromise(promise, url);
       if (!S.activeId || String(method).toUpperCase() !== 'POST') return promise;
 
+      var reqInfo = {
+        headers: headersToObject((init && init.headers) || (input && input.headers)),
+        sid: sessionFromBody(init && init.body)
+      };
       var id = COMPLETION_RE.test(url) ? claim() : null;
+      if (id) S.req[id] = reqInfo;
       return promise.then(function (res) {
         try {
           var myId = id;
           // Endpoint ka naam badal gaya ho toh bhi: koi bhi POST jo SSE de, woh hamara hai
-          if (!myId && S.activeId && isEventStream(res)) myId = claim();
+          if (!myId && S.activeId && isEventStream(res)) {
+            myId = claim();
+            if (myId) S.req[myId] = reqInfo;
+          }
           if (myId) handleFetchResponse(myId, res);
         } catch (e) { log('fetch hook: ' + e); }
         return res;
@@ -249,16 +310,34 @@
   var XP = XMLHttpRequest.prototype;
   if (!XP.open.__fds) {
     var XO = XP.open, XS = XP.send;
+    var XH = XP.setRequestHeader;
     XP.open = function (m, u) {
       this.__fdsM = m;
       this.__fdsU = String(u);
+      this.__fdsH = {};
       return XO.apply(this, arguments);
     };
     XP.open.__fds = true;
-    XP.send = function () {
+    XP.setRequestHeader = function (k, v) {
+      try { if (this.__fdsH) this.__fdsH[k] = v; } catch (e) { /* ignore */ }
+      return XH.apply(this, arguments);
+    };
+    XP.send = function (body) {
       var x = this;
+      if (U.expected && isFileUrl(x.__fdsU)) {
+        var isUpload = /upload/i.test(x.__fdsU);
+        U.pending++;
+        U.last = Date.now();
+        x.addEventListener('loadend', function () {
+          try { noteFileResponse(x.responseText); } catch (e) { U.last = Date.now(); }
+          if (x.status >= 400 || x.status === 0) U.failed = U.failed || ('HTTP ' + x.status);
+          U.pending--;
+          if (isUpload) U.done++;
+        });
+      }
       if (S.activeId && String(x.__fdsM).toUpperCase() === 'POST' && COMPLETION_RE.test(x.__fdsU || '')) {
         var id = claim(), p = makeParser(id), off = 0;
+        S.req[id] = { headers: x.__fdsH || {}, sid: sessionFromBody(body) };
         var pull = function () {
           try {
             var t = x.responseText || '';
@@ -456,10 +535,82 @@
     ready: ready,
     setModes: setModes,
     lastAnswer: lastAnswer,
+    /* list = [{name, mime, data(base64)}] -> page ke file input mein daalo */
+    attach: function (list) {
+      var inputs = document.querySelectorAll('input[type="file"]');
+      if (!inputs.length) return 'nofileinput';
+      var dt = new DataTransfer();
+      for (var i = 0; i < list.length; i++) {
+        var f = list[i];
+        var bin = atob(String(f.data || '').replace(/\s+/g, ''));
+        var arr = new Uint8Array(bin.length);
+        for (var j = 0; j < bin.length; j++) arr[j] = bin.charCodeAt(j);
+        dt.items.add(new File([arr], f.name || ('file' + (i + 1)), { type: f.mime || 'application/octet-stream' }));
+      }
+      U.expected = list.length;
+      U.done = 0;
+      U.pending = 0;
+      U.failed = '';
+      U.last = 0;
+      U.t0 = Date.now();
+      U.statuses = [];
+      var inp = inputs[0];
+      inp.files = dt.files;
+      inp.dispatchEvent(new Event('input', { bubbles: true }));
+      inp.dispatchEvent(new Event('change', { bubbles: true }));
+      return 'ok';
+    },
+    uploadState: function () {
+      if (U.failed) return 'failed:' + U.failed;
+      if (!U.last) return (Date.now() - U.t0 > 15000) ? 'unseen' : 'waiting:0/' + U.expected;
+      var busy = U.statuses.some(function (s) { return /PENDING|PARSING|UPLOADING|PROCESSING|WAIT/.test(s); });
+      if (U.done >= U.expected && U.pending <= 0 && !busy && Date.now() - U.last > 1200) return 'ready';
+      return 'waiting:' + U.done + '/' + U.expected + (U.statuses.length ? ' ' + U.statuses.join(',') : '');
+    },
+    /* Response ke baad chat DeepSeek account se delete (page ki apni auth headers ke saath) */
+    deleteChat: function (id) {
+      var r = S.req[id] || {};
+      delete S.req[id];
+      var sid = r.sid;
+      if (!sid) {
+        var m = /\/chat\/s\/([0-9a-zA-Z-]{8,})/.exec(location.pathname);
+        if (m) sid = m[1];
+      }
+      if (!sid) { S.del[id] = 'fail:no session id'; return 'nosession'; }
+      var h = {}, src = r.headers || {};
+      for (var k in src) {
+        var lk = k.toLowerCase();
+        if (lk.indexOf('pow') >= 0 || lk === 'content-length' || lk === 'accept') continue;
+        h[k] = src[k];
+      }
+      var hasAuth = Object.keys(h).some(function (k) { return k.toLowerCase() === 'authorization'; });
+      if (!hasAuth) {
+        try {
+          var t = JSON.parse(localStorage.getItem('userToken') || 'null');
+          var tok = t && (t.value || t);
+          if (typeof tok === 'string' && tok) h['authorization'] = 'Bearer ' + tok;
+        } catch (e) { /* ignore */ }
+      }
+      h['content-type'] = 'application/json';
+      S.del[id] = 'pending';
+      origFetch.call(window, location.origin + '/api/v0/chat_session/delete', {
+        method: 'POST', headers: h, credentials: 'include',
+        body: JSON.stringify({ chat_session_id: sid })
+      }).then(function (res) {
+        return res.text().then(function (t) {
+          var ok = res.ok;
+          try { var j = JSON.parse(t); if (typeof j.code === 'number' && j.code !== 0) ok = false; } catch (e) { /* ignore */ }
+          S.del[id] = ok ? 'ok' : 'fail:HTTP ' + res.status + ' ' + String(t).slice(0, 150);
+        });
+      }).catch(function (e) { S.del[id] = 'fail:' + e; });
+      return 'started';
+    },
+    deleteState: function (id) { return S.del[id] || 'none'; },
     send: function (id, text) {
       var input = findInput();
       if (!input) return 'noinput';
       if (!setValue(input, text)) return 'setfail';
+      U.expected = 0;
       S.activeId = id;
       setTimeout(function () {
         if (S.activeId === id) pressEnter(findInput() || input);

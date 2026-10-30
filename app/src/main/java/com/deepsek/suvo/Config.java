@@ -34,12 +34,19 @@ public final class Config {
         return prefs(c).getBoolean("keep_alive", true);
     }
 
-    public static void save(Context c, int port, boolean allowLan, String apiKey, boolean keepAlive) {
+    /** Response ke baad DeepSeek account se chat delete karo (temp-chat jaisa). */
+    public static boolean deleteChats(Context c) {
+        return prefs(c).getBoolean("delete_chats", true);
+    }
+
+    public static void save(Context c, int port, boolean allowLan, String apiKey, boolean keepAlive,
+                            boolean deleteChats) {
         prefs(c).edit()
                 .putInt("port", port)
                 .putBoolean("allow_lan", allowLan)
                 .putString("api_key", apiKey == null ? "" : apiKey.trim())
                 .putBoolean("keep_alive", keepAlive)
+                .putBoolean("delete_chats", deleteChats)
                 .apply();
     }
 }

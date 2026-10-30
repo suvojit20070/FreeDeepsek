@@ -201,8 +201,15 @@ public final class OpenAIResponse {
                         if (sb.length() > 0) sb.append('\n');
                         sb.append(textOf(p.opt("content")));
                     } else if (type.contains("image")) {
+                        String url = imageUrlOf(p);
                         if (sb.length() > 0) sb.append('\n');
-                        sb.append("[image omitted]");
+                        if (url.startsWith("http")) sb.append("[image link: ").append(url).append(']');
+                        else sb.append("[attached image]");
+                    } else if (type.contains("file") || "document".equals(type)) {
+                        JSONObject f = p.optJSONObject("file");
+                        String fname = (f != null ? f : p).optString("filename", "");
+                        if (sb.length() > 0) sb.append('\n');
+                        sb.append("[attached file").append(fname.isEmpty() ? "" : ": " + fname).append(']');
                     }
                 }
             }
@@ -210,6 +217,122 @@ public final class OpenAIResponse {
         }
         if (content instanceof JSONObject) return ((JSONObject) content).optString("text", content.toString());
         return String.valueOf(content);
+    }
+
+    /* ---------------------------------------------------------------- files */
+
+    private static final int MAX_FILES = 10;
+
+    private static String imageUrlOf(JSONObject p) {
+        Object iu = p.opt("image_url");
+        if (iu instanceof JSONObject) return ((JSONObject) iu).optString("url", "");
+        if (iu instanceof String) return (String) iu;
+        return p.optString("url", "");
+    }
+
+    /** "data:image/png;base64,AAAA" -> {mime, base64}; data URL nahi toh null. */
+    private static String[] parseDataUrl(String url) {
+        if (url == null || !url.startsWith("data:")) return null;
+        int comma = url.indexOf(',');
+        if (comma < 0) return null;
+        String meta = url.substring(5, comma);
+        if (!meta.contains(";base64")) return null;
+        String mime = meta.substring(0, meta.indexOf(';'));
+        return new String[]{mime.isEmpty() ? "application/octet-stream" : mime, url.substring(comma + 1)};
+    }
+
+    private static String extFor(String mime) {
+        if (mime == null) return "bin";
+        switch (mime.toLowerCase(Locale.ROOT)) {
+            case "image/png": return "png";
+            case "image/jpeg":
+            case "image/jpg": return "jpg";
+            case "image/webp": return "webp";
+            case "image/gif": return "gif";
+            case "application/pdf": return "pdf";
+            case "text/plain": return "txt";
+            case "text/markdown": return "md";
+            case "text/csv": return "csv";
+            case "application/json": return "json";
+            case "application/vnd.openxmlformats-officedocument.wordprocessingml.document": return "docx";
+            case "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": return "xlsx";
+            default: return "bin";
+        }
+    }
+
+    private static String mimeForName(String name) {
+        String n = name.toLowerCase(Locale.ROOT);
+        if (n.endsWith(".png")) return "image/png";
+        if (n.endsWith(".jpg") || n.endsWith(".jpeg")) return "image/jpeg";
+        if (n.endsWith(".webp")) return "image/webp";
+        if (n.endsWith(".pdf")) return "application/pdf";
+        if (n.endsWith(".txt") || n.endsWith(".log")) return "text/plain";
+        if (n.endsWith(".md")) return "text/markdown";
+        if (n.endsWith(".csv")) return "text/csv";
+        if (n.endsWith(".json")) return "application/json";
+        if (n.endsWith(".docx")) return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+        if (n.endsWith(".xlsx")) return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+        return "application/octet-stream";
+    }
+
+    /**
+     * Messages se base64 files nikalo. Supported part types:
+     *   OpenAI:     {"type":"image_url","image_url":{"url":"data:...;base64,..."}}
+     *               {"type":"file","file":{"filename":"a.pdf","file_data":"data:...;base64,..."}}
+     *   Responses:  {"type":"input_image","image_url":"data:..."} / {"type":"input_file","filename","file_data"}
+     *   Anthropic:  {"type":"image"|"document","source":{"type":"base64","media_type","data"}}
+     * http(s) image links download nahi hote; prompt mein link ki tarah jaate hain.
+     */
+    public static JSONArray extractFiles(JSONArray messages) {
+        JSONArray out = new JSONArray();
+        int counter = 0;
+        for (int i = 0; i < messages.length() && out.length() < MAX_FILES; i++) {
+            JSONObject m = messages.optJSONObject(i);
+            if (m == null) continue;
+            JSONArray parts = m.optJSONArray("content");
+            if (parts == null) continue;
+            for (int j = 0; j < parts.length() && out.length() < MAX_FILES; j++) {
+                JSONObject p = parts.optJSONObject(j);
+                if (p == null) continue;
+                String type = p.optString("type", "");
+                String name = "";
+                String mime = null;
+                String data = null;
+
+                if ("image_url".equals(type) || "input_image".equals(type)) {
+                    String[] d = parseDataUrl(imageUrlOf(p));
+                    if (d != null) {
+                        mime = d[0];
+                        data = d[1];
+                    }
+                } else if ("file".equals(type) || "input_file".equals(type)) {
+                    JSONObject f = p.optJSONObject("file");
+                    if (f == null) f = p;
+                    name = f.optString("filename", "");
+                    String fd = f.optString("file_data", "");
+                    String[] d = parseDataUrl(fd);
+                    if (d != null) {
+                        mime = d[0];
+                        data = d[1];
+                    } else if (!fd.isEmpty()) {
+                        mime = mimeForName(name);
+                        data = fd; // raw base64
+                    }
+                } else if ("image".equals(type) || "document".equals(type)) {
+                    JSONObject src = p.optJSONObject("source");
+                    if (src != null && "base64".equals(src.optString("type"))) {
+                        mime = src.optString("media_type", "application/octet-stream");
+                        data = src.optString("data", "");
+                    }
+                }
+
+                if (data == null || data.isEmpty()) continue;
+                counter++;
+                if (name.isEmpty()) name = "file" + counter + "." + extFor(mime);
+                out.put(obj("name", name, "mime", mime == null ? mimeForName(name) : mime, "data", data));
+            }
+        }
+        return out;
     }
 
     /** Assistant ke purane tool_calls ko usi <tool_calls> format mein likho jo model ko sikhaya hai. */

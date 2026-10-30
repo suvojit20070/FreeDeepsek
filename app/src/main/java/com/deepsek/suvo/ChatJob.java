@@ -1,5 +1,7 @@
 package com.deepsek.suvo;
 
+import org.json.JSONArray;
+
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -35,6 +37,8 @@ public final class ChatJob {
     public final boolean think;
     public final boolean search;
     public final boolean stream;
+    /** Attach karne wali files: [{name, mime, data(base64)}], khaali ho sakta hai. */
+    public final JSONArray files;
     public final long created = System.currentTimeMillis() / 1000L;
 
     public final LinkedBlockingQueue<Event> events = new LinkedBlockingQueue<>();
@@ -54,12 +58,13 @@ public final class ChatJob {
     private volatile String finishReason = "stop";
     private volatile String errorMessage;
 
-    public ChatJob(String prompt, String model, boolean think, boolean search, boolean stream) {
+    public ChatJob(String prompt, String model, boolean think, boolean search, boolean stream, JSONArray files) {
         this.prompt = prompt;
         this.model = model;
         this.think = think;
         this.search = search;
         this.stream = stream;
+        this.files = files == null ? new JSONArray() : files;
     }
 
     private void touch() {

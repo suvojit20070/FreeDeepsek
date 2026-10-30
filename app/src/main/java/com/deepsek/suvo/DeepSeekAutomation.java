@@ -24,6 +24,7 @@ public final class DeepSeekAutomation {
     private static final long START_TIMEOUT_MS = 12_000;
     private static final long START_RETRY_MS = 10_000;
     private static final long IDLE_TIMEOUT_MS = 180_000;
+    private static final long UPLOAD_TIMEOUT_MS = 120_000;
     private static final long MAX_JOB_MS = 25 * 60_000;
 
     private final Context app;
@@ -34,6 +35,15 @@ public final class DeepSeekAutomation {
     }
 
     public void run(ChatJob job) throws InterruptedException {
+        try {
+            runSteps(job);
+        } finally {
+            // Request DeepSeek tak gayi thi -> account mein chat bani -> delete karo
+            if (job.isStarted() && Config.deleteChats(app)) deleteChat(job);
+        }
+    }
+
+    private void runSteps(ChatJob job) throws InterruptedException {
         // 1. Fresh chat: home URL reload = naya conversation, purana context nahi
         AppState.log("New chat for request " + job.id.substring(0, 8));
         CountDownLatch loaded = new CountDownLatch(1);
@@ -65,6 +75,23 @@ public final class DeepSeekAutomation {
         String modes = unquote(eval("__fds.setModes(" + job.think + "," + job.search + ")", 5000));
         AppState.log("Modes: " + modes);
         Thread.sleep(modes.contains("toggled") ? 700 : 250);
+
+        // 3b. Files attach + upload complete hone ka wait
+        if (job.files.length() > 0) {
+            String att = unquote(eval("__fds.attach(" + job.files.toString() + ")", 30_000));
+            if (!"ok".equals(att)) {
+                job.fail("File attach failed: " + (att.isEmpty() ? "no result" : att));
+                return;
+            }
+            AppState.log("Uploading " + job.files.length() + " file(s)…");
+            String up = waitUpload(job);
+            if (job.isClosed()) return;
+            if (up.startsWith("failed")) {
+                job.fail("DeepSeek file upload failed: " + up.substring(Math.min(up.length(), 7)));
+                return;
+            }
+            AppState.log("Upload: " + up);
+        }
 
         // 4. Prompt insert + send
         String sent = unquote(eval("__fds.send(" + JSONObject.quote(job.id) + ","
@@ -129,6 +156,47 @@ public final class DeepSeekAutomation {
         } else {
             job.finish(finish);
         }
+    }
+
+    private String waitUpload(ChatJob job) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + UPLOAD_TIMEOUT_MS;
+        String last = "timeout";
+        while (System.currentTimeMillis() < deadline) {
+            if (job.cancelled) {
+                job.fail("Client disconnected");
+                return "cancelled";
+            }
+            String s = unquote(eval("__fds.uploadState()", 4000));
+            if (!s.isEmpty()) last = s;
+            if ("ready".equals(s)) {
+                Thread.sleep(600);
+                return "ready";
+            }
+            if (s.startsWith("failed")) return s;
+            if ("unseen".equals(s)) {
+                // Upload request detect nahi hui (endpoint naam alag ho sakta hai): thoda ruk ke aage badho
+                Thread.sleep(3000);
+                return "unseen (continuing)";
+            }
+            Thread.sleep(700);
+        }
+        return last + " (timeout, continuing)";
+    }
+
+    private void deleteChat(ChatJob job) throws InterruptedException {
+        String r = unquote(eval("__fds.deleteChat(" + JSONObject.quote(job.id) + ")", 4000));
+        if (!"started".equals(r)) {
+            AppState.log("Chat delete skipped: " + r);
+            return;
+        }
+        long deadline = System.currentTimeMillis() + 8000;
+        String st = "pending";
+        while (System.currentTimeMillis() < deadline) {
+            st = unquote(eval("__fds.deleteState(" + JSONObject.quote(job.id) + ")", 3000));
+            if (!"pending".equals(st)) break;
+            Thread.sleep(300);
+        }
+        AppState.log("ok".equals(st) ? "Chat deleted" : "Chat delete: " + st);
     }
 
     private String waitReady(ChatJob job) throws InterruptedException {
