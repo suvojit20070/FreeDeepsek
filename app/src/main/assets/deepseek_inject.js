@@ -13,7 +13,7 @@
   var VERSION = 1;
   var COMPLETION_RE = /\/chat\/(completion|continue|resume|regenerate)(\?|$|#)/i;
   // activeId: jo request bhejni hai; req: id -> {headers, sid} (chat delete ke liye); del: delete status
-  var S = { activeId: null, req: {}, del: {}, lastSid: '', lastHeaders: null };
+  var S = { activeId: null, req: {}, del: {}, lastSid: '', lastHeaders: null, gen: 0 };
   // File upload tracking
   var U = { expected: 0, done: 0, pending: 0, failed: '', last: 0, t0: 0, statuses: [] };
 
@@ -142,6 +142,7 @@
    *  3. Purana patch:  {"p":"response/thinking_content","v":".."} / "response/content"
    */
   function makeParser(id) {
+    var myGen = S.gen;
     var buf = '', lastPath = '', frags = [], got = false, ended = false, errMsg = '', curEvent = '', fin = false, incomplete = false;
 
     // INCOMPLETE = DeepSeek ne beech mein roka (Continue button aata hai)
@@ -160,6 +161,7 @@
     }
 
     function emit(kind, text) {
+      if (myGen !== S.gen) return;
       if (!kind || kind === 'skip' || typeof text !== 'string' || !text) return;
       got = true;
       call('onChunk', id, kind, text);
@@ -251,7 +253,8 @@
       }
       if (l.indexOf('data:') !== 0) return;
       var d = l.slice(5).trim();
-      if (!d || d === '[DONE]') return;
+      if (d === '[DONE]') { fin = true; return; }
+      if (!d) return;
       var o;
       try { o = JSON.parse(d); } catch (e) { return; }
       if (curEvent === 'error') { errMsg = errMsg || d.slice(0, 300); return; }
@@ -280,7 +283,11 @@
         ended = true;
         if (buf.trim()) { line(buf.trim()); buf = ''; }
         if (err) errMsg = errMsg || err;
+        if (myGen !== S.gen) return; // continue ke baad purani stream ignore
         if (incomplete && (!reason || reason === 'stop')) reason = 'incomplete';
+        // Stream band hui par FINISHED nahi aaya = beech mein ruka
+        else if (!got && errMsg && (!reason || reason === 'stop')) reason = 'error';
+        else if (!fin && (!reason || reason === 'stop')) reason = 'unfinished';
         call('onEnd', id, reason || 'stop', got ? '' : errMsg);
       }
     };
@@ -522,10 +529,18 @@
   var CONTINUE_WORDS = ['continue', 'continue generating', '继续', '继续生成'];
 
   function findContinue() {
-    var list = document.querySelectorAll('button,[role="button"]');
-    for (var i = list.length - 1; i >= 0; i--) {
-      var t = (list[i].innerText || '').trim().toLowerCase();
-      if (t && t.length <= 25 && CONTINUE_WORDS.indexOf(t) >= 0 && !isDisabled(list[i])) return list[i];
+    // 1. Button jaise elements; 2. fallback: koi bhi chhota element jiska text "Continue" ho
+    var passes = ['button,[role="button"],[class*="button"],[class*="btn"]', 'div,span'];
+    for (var p = 0; p < passes.length; p++) {
+      var list = document.querySelectorAll(passes[p]);
+      for (var i = list.length - 1; i >= 0; i--) {
+        var el = list[i];
+        if (el.children.length > 4) continue;
+        var t = (el.innerText || '').trim().toLowerCase();
+        if (!t || t.length > 25 || CONTINUE_WORDS.indexOf(t) < 0) continue;
+        var c = el.closest('button,[role="button"],[class*="button"],[class*="btn"]') || el;
+        if (!isDisabled(c) && visible(c)) return c;
+      }
     }
     return null;
   }
@@ -667,7 +682,8 @@
     continueGen: function (id) {
       var b = findContinue();
       if (!b) return 'nobutton';
-      S.activeId = id; // continue wali stream bhi isi request ki hai
+      S.gen++;          // purani atki stream ab kuch nahi bhejegi
+      S.activeId = id;  // continue wali stream bhi isi request ki hai
       clickEl(b);
       return 'clicked';
     },

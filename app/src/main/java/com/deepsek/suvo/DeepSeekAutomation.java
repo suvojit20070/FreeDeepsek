@@ -286,8 +286,15 @@ public final class DeepSeekAutomation {
         // 6. Stream end ka wait
         long begin = System.currentTimeMillis();
         String finish = "stop";
+        boolean stalled = false;
         while (!job.awaitEnd(1000)) {
             long now = System.currentTimeMillis();
+            // Stream khuli hai par 3s se kuch nahi aaya: DeepSeek ruk gaya ho toh Continue button dikhta hai
+            if (now - job.lastActivity() > 3000 && "yes".equals(unquote(eval("__fds.hasContinue()", 2000)))) {
+                AppState.log("Stream stalled, Continue button mila");
+                stalled = true;
+                break;
+            }
             if (job.cancelled) {
                 eval("__fds.stop()", 3000);
                 job.finish("stop");
@@ -309,10 +316,12 @@ public final class DeepSeekAutomation {
 
         // 6b. DeepSeek ne beech mein roka (INCOMPLETE / Continue button) -> Continue click, max 3 baar
         for (int round = 1; round <= MAX_CONTINUES && !job.isClosed() && !job.cancelled; round++) {
-            boolean incomplete = "incomplete".equals(job.endReason());
+            String er = job.endReason();
+            boolean abnormal = stalled || "incomplete".equals(er) || "unfinished".equals(er);
+            stalled = false;
             String has = "no";
-            // INCOMPLETE mila ho toh button render hone ka thoda wait, warna ek quick check
-            long until = System.currentTimeMillis() + (incomplete ? 2500 : 0);
+            // Beech mein ruka ho toh button render hone ka wait (3s), normal FINISHED par sirf quick check
+            long until = System.currentTimeMillis() + (abnormal ? 3000 : 0);
             do {
                 has = unquote(eval("__fds.hasContinue()", 2000));
                 if ("yes".equals(has) || System.currentTimeMillis() >= until) break;
@@ -330,6 +339,11 @@ public final class DeepSeekAutomation {
             long cBegin = System.currentTimeMillis();
             while (!job.awaitEnd(1000)) {
                 long now = System.currentTimeMillis();
+                if (now - job.lastActivity() > 3000 && "yes".equals(unquote(eval("__fds.hasContinue()", 2000)))) {
+                    AppState.log("Continue stream bhi ruki, phir Continue");
+                    stalled = true;
+                    break;
+                }
                 if (job.cancelled || now - job.lastActivity() > IDLE_TIMEOUT_MS || now - cBegin > MAX_JOB_MS) break;
             }
             if (job.cancelled) {
@@ -339,7 +353,7 @@ public final class DeepSeekAutomation {
             }
         }
         if (job.isClosed()) return;
-        if ("incomplete".equals(job.endReason())) finish = "length";
+        if (stalled || "incomplete".equals(job.endReason())) finish = "length";
 
         // 7. Stream se kuch nahi mila toh DOM se last answer (fallback)
         if (job.isEmpty()) {
