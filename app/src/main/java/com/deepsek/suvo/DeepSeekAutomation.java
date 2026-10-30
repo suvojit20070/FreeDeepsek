@@ -129,14 +129,18 @@ public final class DeepSeekAutomation {
             job.fail("Prompt insert failed: " + (filled.isEmpty() ? "no result" : filled));
             return;
         }
-        Thread.sleep(120);
-        eval("__fds.submit()", 3000);
+        Thread.sleep(60); // React ko send button enable karne do
+        String how = unquote(eval("__fds.submit()", 3000));
         long tSent = System.currentTimeMillis();
 
-        // 5. Request start hone ka wait (fetch hook onStart bhejega)
-        if (!job.awaitStart(1500)) {
+        // 5. Request start hone ka wait (fetch hook onStart bhejega). Na ho toh jaldi retry.
+        if (!job.awaitStart(600)) {
             if (job.isClosed()) return;
-            unquote(eval("__fds.clickSend()", 3000));
+            String r2 = unquote(eval("__fds.clickSend()", 3000));
+            if (!job.awaitStart(800) && !job.isClosed()) {
+                String r3 = unquote(eval("__fds.submit('enter')", 3000));
+                AppState.log("Send retries: " + how + " -> " + r2 + " -> " + r3);
+            }
         }
         if (!job.isStarted() && !job.awaitStart(START_TIMEOUT_MS)) {
             if (job.isClosed()) return;

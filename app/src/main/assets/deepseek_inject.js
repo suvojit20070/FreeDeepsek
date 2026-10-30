@@ -462,6 +462,13 @@
     return null;
   }
 
+  function isDisabled(b) {
+    if (b.disabled || b.getAttribute('aria-disabled') === 'true') return true;
+    var cls = b.className;
+    if (cls && typeof cls === 'object' && cls.baseVal != null) cls = cls.baseVal;
+    return /disabled/i.test(String(cls || ''));
+  }
+
   function clickSendIfPending() {
     var input = findInput();
     if (!input) return 'noinput';
@@ -629,11 +636,16 @@
       S.activeId = id;
       return 'ok';
     },
-    submit: function () {
+    /* Pehle Send button click (DeepSeek synthetic Enter ignore karta hai), Enter sirf backup */
+    submit: function (mode) {
       var input = findInput();
       if (!input) return 'noinput';
+      if (mode !== 'enter') {
+        var btn = findSend(input);
+        if (btn && !isDisabled(btn)) { clickEl(btn); return 'clicked'; }
+      }
       pressEnter(input);
-      return 'ok';
+      return 'enter';
     },
     send: function (id, text) {
       var r = this.fill(id, text);
