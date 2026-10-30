@@ -286,9 +286,12 @@ public final class OpenAIResponse {
     public static JSONArray extractFiles(JSONArray messages) {
         JSONArray out = new JSONArray();
         int counter = 0;
-        for (int i = 0; i < messages.length() && out.length() < MAX_FILES; i++) {
+        // Sirf current (aakhri) message ki files attach hoti hain, aur woh bhi tab jab woh user ka ho.
+        // Purane messages ki files dubara upload nahi hoti; prompt mein "[attached file]" text rehta hai.
+        int lastIdx = messages.length() - 1;
+        for (int i = lastIdx; i <= lastIdx && i >= 0 && out.length() < MAX_FILES; i++) {
             JSONObject m = messages.optJSONObject(i);
-            if (m == null) continue;
+            if (m == null || !"user".equalsIgnoreCase(m.optString("role", ""))) continue;
             JSONArray parts = m.optJSONArray("content");
             if (parts == null) continue;
             for (int j = 0; j < parts.length() && out.length() < MAX_FILES; j++) {

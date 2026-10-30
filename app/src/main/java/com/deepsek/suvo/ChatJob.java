@@ -53,6 +53,7 @@ public final class ChatJob {
     private volatile boolean started = false;
     private volatile boolean closed = false;
     private volatile long lastActivity = System.currentTimeMillis();
+    private volatile long firstChunkAt = 0;
     private volatile String endReason;
     private volatile String endError;
     private volatile String finishReason = "stop";
@@ -86,6 +87,7 @@ public final class ChatJob {
         if (isThink) reasoning.append(text);
         else content.append(text);
         touch();
+        if (firstChunkAt == 0) firstChunkAt = lastActivity;
         events.offer(new Event(EV_CHUNK, isThink, text));
     }
 
@@ -145,6 +147,11 @@ public final class ChatJob {
 
     public long lastActivity() {
         return lastActivity;
+    }
+
+    /** Pehla token kab aaya (0 = abhi nahi). */
+    public long firstChunkAt() {
+        return firstChunkAt;
     }
 
     public String endReason() {

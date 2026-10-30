@@ -100,7 +100,7 @@
    *  3. Purana patch:  {"p":"response/thinking_content","v":".."} / "response/content"
    */
   function makeParser(id) {
-    var buf = '', lastPath = '', frags = [], got = false, ended = false, errMsg = '', curEvent = '';
+    var buf = '', lastPath = '', frags = [], got = false, ended = false, errMsg = '', curEvent = '', fin = false;
 
     function fragKind(i) {
       if (i < 0) i = frags.length + i;
@@ -139,6 +139,7 @@
       if (Array.isArray(r.fragments)) addFrags(r.fragments);
       if (typeof r.thinking_content === 'string') emit('think', r.thinking_content);
       if (typeof r.content === 'string') emit('text', r.content);
+      if (r.status && /FINISHED|DONE|COMPLETE/i.test(String(r.status))) fin = true;
     }
 
     function handle(o, base) {
@@ -148,6 +149,7 @@
         var d = o.choices[0].delta || o.choices[0].message || {};
         if (typeof d.reasoning_content === 'string') emit('think', d.reasoning_content);
         if (typeof d.content === 'string') emit(d.type === 'thinking' ? 'think' : 'text', d.content);
+        if (o.choices[0].finish_reason) fin = true;
         return;
       }
 
@@ -176,7 +178,7 @@
 
       if (typeof v === 'string') {
         var path = p || lastPath;
-        if (/status$/.test(path)) return;
+        if (/status$/.test(path)) { if (/FINISHED|DONE|COMPLETE/i.test(v)) fin = true; return; }
         emit(pathKind(path), v);
         return;
       }
@@ -193,7 +195,11 @@
     }
 
     function line(l) {
-      if (l.indexOf('event:') === 0) { curEvent = l.slice(6).trim(); return; }
+      if (l.indexOf('event:') === 0) {
+        curEvent = l.slice(6).trim();
+        if (curEvent === 'finish' || curEvent === 'close') fin = true;
+        return;
+      }
       if (l.indexOf('data:') !== 0) return;
       var d = l.slice(5).trim();
       if (!d || d === '[DONE]') return;
@@ -214,6 +220,7 @@
           if (!l) { curEvent = ''; continue; }
           line(l);
         }
+        if (fin && !ended) this.end('stop');
       },
       raw: function (t) {
         if (!t) return;
@@ -606,19 +613,32 @@
       return 'started';
     },
     deleteState: function (id) { return S.del[id] || 'none'; },
-    send: function (id, text) {
+    /* Khaali home page (naya chat) par hain? Pre-warm check */
+    isFresh: function () {
+      if (ready() !== 'ready') return 'no';
+      if (/\/s\//.test(location.pathname)) return 'no';
+      var input = findInput();
+      return (input && !inputText(input).trim()) ? 'yes' : 'no';
+    },
+    /* Text daalo aur request id arm karo (bhejna submit() se) */
+    fill: function (id, text) {
       var input = findInput();
       if (!input) return 'noinput';
       if (!setValue(input, text)) return 'setfail';
       U.expected = 0;
       S.activeId = id;
-      setTimeout(function () {
-        if (S.activeId === id) pressEnter(findInput() || input);
-      }, 250);
-      setTimeout(function () {
-        if (S.activeId === id) clickSendIfPending();
-      }, 1800);
       return 'ok';
+    },
+    submit: function () {
+      var input = findInput();
+      if (!input) return 'noinput';
+      pressEnter(input);
+      return 'ok';
+    },
+    send: function (id, text) {
+      var r = this.fill(id, text);
+      if (r === 'ok') this.submit();
+      return r;
     },
     clickSend: clickSendIfPending,
     cancel: function () { S.activeId = null; return 'ok'; },

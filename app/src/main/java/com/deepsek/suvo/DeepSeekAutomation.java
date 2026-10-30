@@ -29,6 +29,8 @@ public final class DeepSeekAutomation {
 
     private final Context app;
     private final Handler main = new Handler(Looper.getMainLooper());
+    /** Reload se pehle purane page par set kiya token; naya page aane tak "old" milega. */
+    private volatile String navToken;
 
     public DeepSeekAutomation(Context app) {
         this.app = app.getApplicationContext();
@@ -40,24 +42,46 @@ public final class DeepSeekAutomation {
         } finally {
             // Request DeepSeek tak gayi thi -> account mein chat bani -> delete karo
             if (job.isStarted() && Config.deleteChats(app)) deleteChat(job);
+            // Agli request ke liye fresh page abhi se load kar do (pre-warm)
+            prewarm();
         }
     }
 
-    private void runSteps(ChatJob job) throws InterruptedException {
-        // 1. Fresh chat: home URL reload = naya conversation, purana context nahi
-        AppState.log("New chat for request " + job.id.substring(0, 8));
-        CountDownLatch loaded = new CountDownLatch(1);
+    /** Next request ke liye home page background mein load kar do. */
+    public void prewarm() {
         main.post(() -> {
-            try {
-                WebView w = WebViewManager.get().obtain(app);
-                w.stopLoading();
-                w.loadUrl(HOME_URL);
-            } finally {
-                loaded.countDown();
-            }
+            WebView w = WebViewManager.get().obtain(app);
+            w.loadUrl(HOME_URL);
         });
-        loaded.await(5, TimeUnit.SECONDS);
-        Thread.sleep(800);
+    }
+
+    private void runSteps(ChatJob job) throws InterruptedException {
+        long t0 = System.currentTimeMillis();
+
+        // 1. Fresh chat: pre-warmed page pehle se khaali home par ho toh reload skip
+        String fresh = unquote(eval("window.__fds ? __fds.isFresh() : 'no'", 3000));
+        boolean reloaded = false;
+        if (!"yes".equals(fresh)) {
+            AppState.log("New chat (reload) for " + job.id.substring(0, 8));
+            String token = "n" + System.nanoTime();
+            evalRaw("window.__fdsNav=" + JSONObject.quote(token) + ";", 2000);
+            CountDownLatch loaded = new CountDownLatch(1);
+            main.post(() -> {
+                try {
+                    WebView w = WebViewManager.get().obtain(app);
+                    w.stopLoading();
+                    w.loadUrl(HOME_URL);
+                } finally {
+                    loaded.countDown();
+                }
+            });
+            loaded.await(5, TimeUnit.SECONDS);
+            reloaded = true;
+            navToken = token;
+        } else {
+            navToken = null;
+            AppState.log("New chat (pre-warmed) for " + job.id.substring(0, 8));
+        }
 
         // 2. Page ready?
         String state = waitReady(job);
@@ -71,10 +95,15 @@ public final class DeepSeekAutomation {
             return;
         }
 
+        if (reloaded) Thread.sleep(300); // React hydrate
+        long tReady = System.currentTimeMillis();
+
         // 3. DeepThink / Search toggles
         String modes = unquote(eval("__fds.setModes(" + job.think + "," + job.search + ")", 5000));
-        AppState.log("Modes: " + modes);
-        Thread.sleep(modes.contains("toggled") ? 700 : 250);
+        if (modes.contains("toggled")) {
+            AppState.log("Modes: " + modes);
+            Thread.sleep(350);
+        }
 
         // 3b. Files attach + upload complete hone ka wait
         if (job.files.length() > 0) {
@@ -93,16 +122,23 @@ public final class DeepSeekAutomation {
             AppState.log("Upload: " + up);
         }
 
-        // 4. Prompt insert + send
-        String sent = unquote(eval("__fds.send(" + JSONObject.quote(job.id) + ","
+        // 4. Prompt insert, phir Enter (JS timers nahi: background mein throttle hote hain)
+        String filled = unquote(eval("__fds.fill(" + JSONObject.quote(job.id) + ","
                 + JSONObject.quote(job.prompt) + ")", 10_000));
-        if (!"ok".equals(sent)) {
-            job.fail("Prompt insert failed: " + (sent.isEmpty() ? "no result" : sent));
+        if (!"ok".equals(filled)) {
+            job.fail("Prompt insert failed: " + (filled.isEmpty() ? "no result" : filled));
             return;
         }
+        Thread.sleep(120);
+        eval("__fds.submit()", 3000);
+        long tSent = System.currentTimeMillis();
 
         // 5. Request start hone ka wait (fetch hook onStart bhejega)
-        if (!job.awaitStart(START_TIMEOUT_MS)) {
+        if (!job.awaitStart(1500)) {
+            if (job.isClosed()) return;
+            unquote(eval("__fds.clickSend()", 3000));
+        }
+        if (!job.isStarted() && !job.awaitStart(START_TIMEOUT_MS)) {
             if (job.isClosed()) return;
             String r = unquote(eval("__fds.clickSend()", 5000));
             AppState.log("Send retry: " + r);
@@ -156,6 +192,11 @@ public final class DeepSeekAutomation {
         } else {
             job.finish(finish);
         }
+
+        long tEnd = System.currentTimeMillis();
+        long first = job.firstChunkAt();
+        AppState.log("\u23F1 ready " + (tReady - t0) + "ms · send " + (tSent - tReady) + "ms · first token "
+                + (first > 0 ? (first - tSent) + "ms" : "-") + " · total " + (tEnd - t0) + "ms");
     }
 
     private String waitUpload(ChatJob job) throws InterruptedException {
@@ -208,19 +249,19 @@ public final class DeepSeekAutomation {
                 job.fail("Client disconnected");
                 return "cancelled";
             }
-            String s = unquote(eval("window.__fds ? __fds.ready() : 'noscript'", 4000));
+            String tok = navToken;
+            String expr = (tok != null ? "(window.__fdsNav===" + JSONObject.quote(tok) + ") ? 'old' : " : "")
+                    + "(window.__fds ? __fds.ready() : 'noscript')";
+            String s = unquote(eval(expr, 4000));
             if (!s.isEmpty()) last = s;
-            if ("ready".equals(s)) {
-                Thread.sleep(700); // React hydrate hone do
-                return "ready";
-            }
+            if ("ready".equals(s)) return "ready";
             if ("login".equals(s)) return "login";
             if ("noscript".equals(s) && System.currentTimeMillis() - injectedAt > 3000) {
                 injectedAt = System.currentTimeMillis();
                 String script = DeepSeekWebView.injectScript(app);
                 if (!script.isEmpty()) evalRaw(script, 4000);
             }
-            Thread.sleep(500);
+            Thread.sleep(150);
         }
         return last;
     }
