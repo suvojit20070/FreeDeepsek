@@ -8,16 +8,20 @@ import android.webkit.WebView;
 import org.json.JSONObject;
 import org.json.JSONTokener;
 
-import java.util.Iterator;
-import java.util.LinkedHashMap;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
 /**
  * Ek job ke steps (queue thread par chalte hain, WebView ka kaam main thread par post hota hai):
- * fresh chat -> page ready -> DeepThink/Search set -> prompt insert + send
- * -> stream start ka wait -> stream end ka wait -> finish.
+ * account chuno (round-robin) -> fresh chat -> page ready -> DeepThink/Search -> files
+ * -> prompt + send -> stream -> (Continue) -> finish.
+ * Account fail ho (login, limit, send fail, empty error) aur client ko abhi kuch content nahi gaya ho,
+ * toh request agle account par retry hoti hai aur fail account ko cooldown milta hai.
  */
 public final class DeepSeekAutomation {
 
@@ -27,131 +31,100 @@ public final class DeepSeekAutomation {
     private static final long START_TIMEOUT_MS = 12_000;
     private static final long START_RETRY_MS = 10_000;
     private static final long IDLE_TIMEOUT_MS = 180_000;
+    private static final long MAX_JOB_MS = 25 * 60_000;
     private static final long UPLOAD_TIMEOUT_MS = 120_000;
     private static final int MAX_CONTINUES = 3;
-    private static final long MAX_JOB_MS = 25 * 60_000;
+
+    private static final long COOLDOWN_LOGIN_MS = 30 * 60_000L;
+    private static final long COOLDOWN_LIMIT_MS = 10 * 60_000L;
+    private static final long COOLDOWN_SHORT_MS = 60_000L;
+
+    /** Is account par ye attempt fail hua; agla account try karo. */
+    private static final class AccountFailure extends Exception {
+        final long cooldownMs;
+
+        AccountFailure(String msg, long cooldownMs) {
+            super(msg);
+            this.cooldownMs = cooldownMs;
+        }
+    }
 
     private final Context app;
     private final Handler main = new Handler(Looper.getMainLooper());
+
     /** Reload se pehle purane page par set kiya token; naya page aane tak "old" milega. */
     private volatile String navToken;
-    /** Same-chat mode: abhi wali DeepSeek chat ka session id. */
-    private volatile String curSid;
-    /** Same-chat mode: reply fingerprint -> DeepSeek chat (insertion order = sabse purana pehle). */
-    private final LinkedHashMap<String, Session> sessions = new LinkedHashMap<>();
-    private static final int MAX_SESSIONS = 20;
-    private static final long SESSION_IDLE_MS = 30 * 60_000L;
+    /** Is attempt ka account (eval/navigate isi ke WebView par). */
+    private volatile String acc = Config.DEFAULT_ACCOUNT;
+
+    private int rr = 0;
+    private final Map<String, Long> cooldownUntil = new HashMap<>();
 
     public DeepSeekAutomation(Context app) {
         this.app = app.getApplicationContext();
     }
 
-    public void run(ChatJob job) throws InterruptedException {
-        boolean same = Config.sameChat(app);
-        if (!same && !sessions.isEmpty()) dropAllSessions();   // mode badla
-        if (same) expireSessions();
+    /* ---------------------------------------------------------------- rotation */
 
-        // Har conversation ka apna DeepSeek chat: client ke aakhri assistant msg ka fingerprint = key
-        Session s = null;
-        boolean cont = false;
-        if (same) {
-            if (job.lastAssistantFp == null) {
-                AppState.log("New chat: request mein pichhla assistant message nahi (nayi conversation)");
-            } else if ((s = sessions.remove(job.lastAssistantFp)) == null) {
-                AppState.log("New chat: history kisi saved chat se match nahi hui ["
-                        + shorten(job.lastAssistantFp) + "] · saved " + sessions.size());
-            } else if (job.followUp == null) {
-                AppState.log("New chat: follow-up khaali");
-                sessions.put(job.lastAssistantFp, s);
-                s = null;
-            } else {
-                cont = true;
-                curSid = s.sid;
-            }
-        }
-
-        try {
-            runSteps(job, cont);
-        } finally {
-            if (same) {
-                // Chat zinda rakho; is reply ke fingerprint se session save karo
-                String sid = job.isStarted() ? unquote(eval("__fds.lastSession()", 3000)) : "";
-                if (!sid.isEmpty()) {
-                    ToolCallParser.Result r = ToolCallParser.parse(job.content(), null);
-                    String fp = r.hasCalls()
-                            ? OpenAIResponse.fingerprint(r.content, r.toolCalls)
-                            : OpenAIResponse.fingerprint(job.content(), null);
-                    if (fp != null) {
-                        sessions.put(fp, new Session(sid));
-                        trimSessions();
-                    }
-                } else if (s != null) {
-                    sessions.put(job.lastAssistantFp, s); // request gayi hi nahi: purana session wapas
-                }
-            } else {
-                // Request DeepSeek tak gayi thi -> account mein chat bani -> delete karo
-                if (job.isStarted() && Config.deleteChats(app)) deleteChat(job);
-                // Agli request ke liye fresh page abhi se load kar do (pre-warm)
-                prewarm();
-            }
-        }
-    }
-
-    /* ---------------------------------------------------------------- same-chat sessions */
-
-    private static final class Session {
-        final String sid;
-        final long lastUsed = System.currentTimeMillis();
-
-        Session(String sid) {
-            this.sid = sid;
-        }
-    }
-
-    private static String shorten(String fp) {
-        return fp.length() > 40 ? fp.substring(0, 40) + "…" : fp;
-    }
-
-    private boolean sidInUse(String sid) {
-        for (Session x : sessions.values()) if (x.sid.equals(sid)) return true;
-        return false;
-    }
-
-    private void deleteSid(String sid) throws InterruptedException {
-        if (!Config.deleteChats(app) || sidInUse(sid)) return;
-        waitDelete("sid:" + sid, unquote(eval("__fds.deleteSid(" + JSONObject.quote(sid) + ")", 4000)));
-    }
-
-    /** MAX_SESSIONS se zyada ho toh sabse purane delete. */
-    private void trimSessions() throws InterruptedException {
-        while (sessions.size() > MAX_SESSIONS) {
-            Iterator<Map.Entry<String, Session>> it = sessions.entrySet().iterator();
-            Session old = it.next().getValue();
-            it.remove();
-            deleteSid(old.sid);
-        }
-    }
-
-    /** SESSION_IDLE_MS se purane sessions delete. */
-    private void expireSessions() throws InterruptedException {
+    /** Round-robin order: available accounts pehle, cooldown wale baad mein (jo jaldi free ho pehle). */
+    private List<String> pickOrder() {
+        List<String> ids = Config.accountIds(app);
+        int n = ids.size();
+        int start = Math.floorMod(rr++, n);
         long now = System.currentTimeMillis();
-        Iterator<Map.Entry<String, Session>> it = sessions.entrySet().iterator();
-        java.util.List<String> dead = new java.util.ArrayList<>();
-        while (it.hasNext()) {
-            Session x = it.next().getValue();
-            if (now - x.lastUsed > SESSION_IDLE_MS) {
-                it.remove();
-                dead.add(x.sid);
-            }
+        List<String> ready = new ArrayList<>();
+        List<String> cooling = new ArrayList<>();
+        for (int i = 0; i < n; i++) {
+            String id = ids.get((start + i) % n);
+            Long until = cooldownUntil.get(id);
+            if (until == null || until <= now) ready.add(id);
+            else cooling.add(id);
         }
-        for (String sid : dead) deleteSid(sid);
+        cooling.sort((a, b) -> Long.compare(cooldownUntil.get(a), cooldownUntil.get(b)));
+        ready.addAll(cooling);
+        return ready;
     }
 
-    private void dropAllSessions() throws InterruptedException {
-        java.util.List<String> all = new java.util.ArrayList<>();
-        for (Session x : sessions.values()) all.add(x.sid);
-        sessions.clear();
-        for (String sid : all) deleteSid(sid);
+    public void run(ChatJob job) throws InterruptedException {
+        List<String> order = pickOrder();
+        String lastError = null;
+        for (int attempt = 0; attempt < order.size(); attempt++) {
+            acc = order.get(attempt);
+            String label = Config.accountLabel(app, acc);
+            if (attempt > 0) {
+                job.resetForRetry();
+                AppState.log("Retry on " + label);
+            }
+            AppState.setJob("Working · " + label + " · " + job.model);
+            try {
+                runSteps(job, label);
+                cooldownUntil.remove(acc);
+                return;
+            } catch (AccountFailure f) {
+                lastError = label + ": " + f.getMessage();
+                cooldownUntil.put(acc, System.currentTimeMillis() + f.cooldownMs);
+                AppState.log(lastError + " → cooldown " + (f.cooldownMs / 60_000) + " min");
+                if (job.isClosed() || job.cancelled || !job.isEmpty()) break;
+            } finally {
+                // Is account par chat bani thi toh delete; agli request ke liye page pre-warm
+                if (job.isStarted() && Config.deleteChats(app)) deleteChat(job);
+                prewarm(acc);
+            }
+        }
+        if (!job.isClosed()) {
+            job.fail(lastError != null ? "Sab accounts fail: " + lastError : "Koi account available nahi");
+        }
+    }
+
+    /* ---------------------------------------------------------------- web helpers */
+
+    private WebView web() {
+        return WebViewManager.get().obtain(app, acc);
+    }
+
+    /** Next request ke liye account ka home page background mein load. */
+    public void prewarm(String accId) {
+        main.post(() -> WebViewManager.get().obtain(app, accId).loadUrl(HOME_URL));
     }
 
     /** loadUrl ke saath navigation token, taaki waitReady purane page ko "ready" na samjhe. */
@@ -161,7 +134,7 @@ public final class DeepSeekAutomation {
         CountDownLatch loaded = new CountDownLatch(1);
         main.post(() -> {
             try {
-                WebView w = WebViewManager.get().obtain(app);
+                WebView w = web();
                 w.stopLoading();
                 w.loadUrl(url);
             } finally {
@@ -172,55 +145,40 @@ public final class DeepSeekAutomation {
         navToken = token;
     }
 
-    /** Next request ke liye home page background mein load kar do. */
-    public void prewarm() {
-        main.post(() -> {
-            WebView w = WebViewManager.get().obtain(app);
-            w.loadUrl(HOME_URL);
-        });
+    private static boolean looksLikeLimit(String err) {
+        String e = err == null ? "" : err.toLowerCase(Locale.ROOT);
+        return e.contains("429") || e.contains("limit") || e.contains("too many") || e.contains("busy")
+                || e.contains("频繁") || e.contains("上限");
     }
 
-    private void runSteps(ChatJob job, boolean cont) throws InterruptedException {
+    private static boolean looksLikeAuth(String err) {
+        String e = err == null ? "" : err.toLowerCase(Locale.ROOT);
+        return e.contains("401") || e.contains("token") || e.contains("login") || e.contains("unauthor")
+                || e.contains("40003");
+    }
+
+    /* ---------------------------------------------------------------- steps */
+
+    private void runSteps(ChatJob job, String label) throws InterruptedException, AccountFailure {
         long t0 = System.currentTimeMillis();
-        String prompt = cont ? job.followUp : job.prompt;
         boolean reloaded = false;
 
-        if (cont) {
-            // 1a. Same chat: page pehle se usi chat par ho toh seedha bhejo, warna chat kholo
-            String sid = curSid;
-            String on = unquote(eval("window.__fds ? __fds.onChat(" + JSONObject.quote(sid) + ") : 'no'", 3000));
-            if ("yes".equals(on)) {
-                navToken = null;
-                AppState.log("Same chat (follow-up only) for " + job.id.substring(0, 8));
-            } else {
-                AppState.log("Same chat (reopen) for " + job.id.substring(0, 8));
-                navigate(HOME_URL + "a/chat/s/" + sid);
-                reloaded = true;
-            }
+        // 1. Fresh chat: pre-warmed page pehle se khaali home par ho toh reload skip
+        String fresh = unquote(eval("window.__fds ? __fds.isFresh() : 'no'", 3000));
+        if ("yes".equals(fresh)) {
+            navToken = null;
+            AppState.log(label + ": new chat (pre-warmed)");
         } else {
-            // 1b. Fresh chat: pre-warmed page pehle se khaali home par ho toh reload skip
-            String fresh = unquote(eval("window.__fds ? __fds.isFresh() : 'no'", 3000));
-            if ("yes".equals(fresh)) {
-                navToken = null;
-                AppState.log("New chat (pre-warmed) for " + job.id.substring(0, 8));
-            } else {
-                AppState.log("New chat (reload) for " + job.id.substring(0, 8));
-                navigate(HOME_URL);
-                reloaded = true;
-            }
+            AppState.log(label + ": new chat (reload)");
+            navigate(HOME_URL);
+            reloaded = true;
         }
 
         // 2. Page ready?
         String state = waitReady(job);
         if (job.isClosed()) return;
-        if ("login".equals(state)) {
-            job.fail("DeepSeek login required. Free Deepsek app kholo aur WebView mein login karo.");
-            return;
-        }
-        if (!"ready".equals(state)) {
-            job.fail("DeepSeek page ready nahi hua (" + state + "). App kholke page check karo.");
-            return;
-        }
+        if ("login".equals(state)) throw new AccountFailure("login required", COOLDOWN_LOGIN_MS);
+        if (!"ready".equals(state)) throw new AccountFailure("page ready nahi hua (" + state + ")", COOLDOWN_SHORT_MS);
 
         if (reloaded) Thread.sleep(300); // React hydrate
         long tReady = System.currentTimeMillis();
@@ -236,25 +194,25 @@ public final class DeepSeekAutomation {
         if (job.files.length() > 0) {
             String att = unquote(eval("__fds.attach(" + job.files.toString() + ")", 30_000));
             if (!"ok".equals(att)) {
-                job.fail("File attach failed: " + (att.isEmpty() ? "no result" : att));
-                return;
+                throw new AccountFailure("file attach failed: " + (att.isEmpty() ? "no result" : att), COOLDOWN_SHORT_MS);
             }
             AppState.log("Uploading " + job.files.length() + " file(s)…");
             String up = waitUpload(job);
             if (job.isClosed()) return;
             if (up.startsWith("failed")) {
-                job.fail("DeepSeek file upload failed: " + up.substring(Math.min(up.length(), 7)));
-                return;
+                String err = up.substring(Math.min(up.length(), 7));
+                throw new AccountFailure("file upload failed: " + err,
+                        looksLikeLimit(err) ? COOLDOWN_LIMIT_MS : COOLDOWN_SHORT_MS);
             }
             AppState.log("Upload: " + up);
         }
 
-        // 4. Prompt insert, phir Enter (JS timers nahi: background mein throttle hote hain)
+        // 4. Prompt insert, phir Send button (JS timers nahi: background mein throttle hote hain)
         String filled = unquote(eval("__fds.fill(" + JSONObject.quote(job.id) + ","
-                + JSONObject.quote(prompt) + ")", 10_000));
+                + JSONObject.quote(job.prompt) + ")", 10_000));
         if (!"ok".equals(filled)) {
-            job.fail("Prompt insert failed: " + (filled.isEmpty() ? "no result" : filled));
-            return;
+            throw new AccountFailure("prompt insert failed: " + (filled.isEmpty() ? "no result" : filled),
+                    COOLDOWN_SHORT_MS);
         }
         Thread.sleep(60); // React ko send button enable karne do
         String how = unquote(eval("__fds.submit()", 3000));
@@ -275,10 +233,8 @@ public final class DeepSeekAutomation {
             AppState.log("Send retry: " + r);
             if (!job.awaitStart(START_RETRY_MS)) {
                 eval("__fds.cancel()", 3000);
-                if (!job.isClosed()) {
-                    job.fail("DeepSeek par message send nahi hua (completion request detect nahi hui).");
-                }
-                return;
+                if (job.isClosed()) return;
+                throw new AccountFailure("message send nahi hua", COOLDOWN_SHORT_MS);
             }
         }
         if (job.isClosed()) return;
@@ -319,7 +275,7 @@ public final class DeepSeekAutomation {
             String er = job.endReason();
             boolean abnormal = stalled || "incomplete".equals(er) || "unfinished".equals(er);
             stalled = false;
-            String has = "no";
+            String has;
             // Beech mein ruka ho toh button render hone ka wait (3s), normal FINISHED par sirf quick check
             long until = System.currentTimeMillis() + (abnormal ? 3000 : 0);
             do {
@@ -366,16 +322,17 @@ public final class DeepSeekAutomation {
         }
 
         if (job.isEmpty()) {
+            // Is account se kuch nahi mila: limit/auth/other -> agla account
             String err = job.endError();
-            job.fail(err != null ? "DeepSeek error: " + err : "DeepSeek ne empty response diya");
-        } else {
-            job.finish(finish);
+            long cd = looksLikeAuth(err) ? COOLDOWN_LOGIN_MS : looksLikeLimit(err) ? COOLDOWN_LIMIT_MS : COOLDOWN_SHORT_MS;
+            throw new AccountFailure(err != null ? "DeepSeek error: " + err : "empty response", cd);
         }
+        job.finish(finish);
 
         long tEnd = System.currentTimeMillis();
         long first = job.firstChunkAt();
-        AppState.log("\u23F1 ready " + (tReady - t0) + "ms · send " + (tSent - tReady) + "ms · first token "
-                + (first > 0 ? (first - tSent) + "ms" : "-") + " · total " + (tEnd - t0) + "ms");
+        AppState.log("⏱ " + label + " · ready " + (tReady - t0) + "ms · send " + (tSent - tReady)
+                + "ms · first token " + (first > 0 ? (first - tSent) + "ms" : "-") + " · total " + (tEnd - t0) + "ms");
     }
 
     private String waitUpload(ChatJob job) throws InterruptedException {
@@ -404,19 +361,15 @@ public final class DeepSeekAutomation {
     }
 
     private void deleteChat(ChatJob job) throws InterruptedException {
-        waitDelete(job.id, unquote(eval("__fds.deleteChat(" + JSONObject.quote(job.id) + ")", 4000)));
-    }
-
-    /** startResult = JS deleteChat/deleteSid ka return; "started" ho toh result ka wait. */
-    private void waitDelete(String key, String startResult) throws InterruptedException {
-        if (!"started".equals(startResult)) {
-            AppState.log("Chat delete skipped: " + startResult);
+        String r = unquote(eval("__fds.deleteChat(" + JSONObject.quote(job.id) + ")", 4000));
+        if (!"started".equals(r)) {
+            AppState.log("Chat delete skipped: " + r);
             return;
         }
         long deadline = System.currentTimeMillis() + 8000;
         String st = "pending";
         while (System.currentTimeMillis() < deadline) {
-            st = unquote(eval("__fds.deleteState(" + JSONObject.quote(key) + ")", 3000));
+            st = unquote(eval("__fds.deleteState(" + JSONObject.quote(job.id) + ")", 3000));
             if (!"pending".equals(st)) break;
             Thread.sleep(300);
         }
@@ -449,7 +402,7 @@ public final class DeepSeekAutomation {
         return last;
     }
 
-    /** try/catch wrapper ke saath JS expression evaluate. */
+    /** try/catch wrapper ke saath JS expression evaluate (is attempt ke account par). */
     private String eval(String expr, long timeoutMs) throws InterruptedException {
         String js = "(function(){try{return " + expr + ";}catch(e){return 'err:'+e;}})()";
         return evalRaw(js, timeoutMs);
@@ -459,13 +412,8 @@ public final class DeepSeekAutomation {
         final String[] out = {null};
         final CountDownLatch latch = new CountDownLatch(1);
         main.post(() -> {
-            WebView w = WebViewManager.get().current();
-            if (w == null) {
-                latch.countDown();
-                return;
-            }
             try {
-                w.evaluateJavascript(js, value -> {
+                web().evaluateJavascript(js, value -> {
                     out[0] = value;
                     latch.countDown();
                 });

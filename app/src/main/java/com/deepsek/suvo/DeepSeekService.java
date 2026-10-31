@@ -48,7 +48,7 @@ public class DeepSeekService extends Service implements AppState.Listener {
 
         RequestQueue.get().init(this);
         WebViewManager wm = WebViewManager.get();
-        wm.obtain(this);
+        wm.ensureAll(this);
         if (!wm.isAttachedToActivity()) wm.park();
 
         startServer();

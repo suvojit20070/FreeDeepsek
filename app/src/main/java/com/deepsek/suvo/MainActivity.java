@@ -36,6 +36,7 @@ public class MainActivity extends Activity implements AppState.Listener {
     private Button btnService;
     private Button btnOverlay;
     private Button btnBattery;
+    private Button btnAccounts;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -51,12 +52,14 @@ public class MainActivity extends Activity implements AppState.Listener {
         btnBattery = findViewById(R.id.btnBattery);
         Button btnSettings = findViewById(R.id.btnSettings);
         Button btnReload = findViewById(R.id.btnReload);
+        btnAccounts = findViewById(R.id.btnAccounts);
 
         btnService.setOnClickListener(v -> toggleService());
         btnOverlay.setOnClickListener(v -> openOverlaySettings());
         btnBattery.setOnClickListener(v -> requestBatteryExemption());
         btnSettings.setOnClickListener(v -> showSettings());
         btnReload.setOnClickListener(v -> WebViewManager.get().reload());
+        btnAccounts.setOnClickListener(v -> showAccounts());
         tvEndpoint.setOnClickListener(v -> copyEndpoint());
 
         if (Build.VERSION.SDK_INT >= 33
@@ -117,6 +120,8 @@ public class MainActivity extends Activity implements AppState.Listener {
         tvEndpoint.setText(endpoint() + (Config.apiKey(this).isEmpty() ? "" : "   (API key on)"));
         tvLog.setText(AppState.lastLog);
         btnService.setText(running ? "Stop service" : "Start service");
+        btnAccounts.setText("👤 " + Config.accountLabel(this, WebViewManager.get().shownId())
+                + " (" + Config.accounts(this).size() + ")");
 
         boolean overlay = Settings.canDrawOverlays(this);
         btnOverlay.setText(overlay ? "Overlay ✓" : "Allow overlay");
@@ -166,6 +171,61 @@ public class MainActivity extends Activity implements AppState.Listener {
         }
     }
 
+    /* ---------------------------------------------------------------- accounts dialog */
+
+    /**
+     * Account chuno = woh WebView screen par aata hai (usme login/logout karo).
+     * Requests saare accounts par bari-bari (round-robin) chalti hain.
+     */
+    private void showAccounts() {
+        java.util.List<Config.Account> list = Config.accounts(this);
+        String[] labels = new String[list.size()];
+        int checked = 0;
+        String shown = WebViewManager.get().shownId();
+        for (int i = 0; i < list.size(); i++) {
+            labels[i] = list.get(i).label;
+            if (list.get(i).id.equals(shown)) checked = i;
+        }
+        final int[] sel = {checked};
+
+        AlertDialog.Builder b = new AlertDialog.Builder(this)
+                .setTitle("Accounts · requests bari-bari se")
+                .setSingleChoiceItems(labels, checked, (d, which) -> sel[0] = which)
+                .setPositiveButton("Show", (d, w) -> {
+                    WebViewManager.get().show(list.get(sel[0]).id);
+                    render();
+                })
+                .setNeutralButton("+ Add", (d, w) -> {
+                    String id = Config.addAccount(this);
+                    WebViewManager.get().ensureAll(this);
+                    WebViewManager.get().show(id);
+                    Toast.makeText(this, Config.accountLabel(this, id)
+                            + " bana. Ab neeche WebView mein is account se login karo.", Toast.LENGTH_LONG).show();
+                    if (!WebViewManager.multiProfileSupported()) {
+                        Toast.makeText(this, "Is phone ka WebView multi-account support nahi karta. "
+                                + "Play Store se 'Android System WebView' update karo.", Toast.LENGTH_LONG).show();
+                    }
+                    render();
+                });
+        if (list.size() > 1) {
+            b.setNegativeButton("Remove", (d, w) -> confirmRemove(list.get(sel[0])));
+        }
+        b.show();
+    }
+
+    private void confirmRemove(Config.Account a) {
+        new AlertDialog.Builder(this)
+                .setTitle("Remove " + a.label + "?")
+                .setMessage("Is account ka login aur data is app se hat jayega.")
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("Remove", (d, w) -> {
+                    Config.removeAccount(this, a.id);
+                    WebViewManager.get().ensureAll(this);
+                    render();
+                })
+                .show();
+    }
+
     /* ---------------------------------------------------------------- settings dialog */
 
     private int dp(int v) {
@@ -212,13 +272,8 @@ public class MainActivity extends Activity implements AppState.Listener {
         cbKeep.setChecked(Config.keepAlive(this));
         root.addView(cbKeep, marginParams());
 
-        CheckBox cbSame = new CheckBox(this);
-        cbSame.setText("Same chat continue karo (OFF = har request naya chat)");
-        cbSame.setChecked(Config.sameChat(this));
-        root.addView(cbSame, marginParams());
-
         CheckBox cbDelete = new CheckBox(this);
-        cbDelete.setText("DeepSeek chat delete karo (naya mode: har response ke baad · same mode: chat badalne par)");
+        cbDelete.setText("Response ke baad DeepSeek chat delete karo");
         cbDelete.setChecked(Config.deleteChats(this));
         LinearLayout.LayoutParams last = marginParams();
         last.bottomMargin = dp(12);
@@ -243,7 +298,7 @@ public class MainActivity extends Activity implements AppState.Listener {
                         Toast.makeText(this, "LAN on hai: API key set karna better hai", Toast.LENGTH_LONG).show();
                     }
                     Config.save(this, port, cbLan.isChecked(), etKey.getText().toString(), cbKeep.isChecked(),
-                            cbDelete.isChecked(), cbSame.isChecked());
+                            cbDelete.isChecked());
                     if (DeepSeekService.isRunning()) {
                         startService(new Intent(this, DeepSeekService.class)
                                 .setAction(DeepSeekService.ACTION_RESTART_SERVER));

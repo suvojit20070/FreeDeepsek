@@ -75,6 +75,11 @@
                 android:text="Battery unrestricted" />
 
             <Button
+                android:id="@+id/btnAccounts"
+                style="@style/FdsChip"
+                android:text="Accounts" />
+
+            <Button
                 android:id="@+id/btnReload"
                 style="@style/FdsChip"
                 android:text="Reload" />

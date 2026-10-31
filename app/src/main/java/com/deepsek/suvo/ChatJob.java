@@ -45,7 +45,7 @@ public final class ChatJob {
 
     private final StringBuilder content = new StringBuilder();
     private final StringBuilder reasoning = new StringBuilder();
-    private final CountDownLatch startLatch = new CountDownLatch(1);
+    private volatile CountDownLatch startLatch = new CountDownLatch(1);
     // Continue ke baad dobara wait karna padta hai, isliye ye latches reset ho sakte hain
     private volatile CountDownLatch endLatch = new CountDownLatch(1);
     private volatile CountDownLatch restartLatch = new CountDownLatch(1);
@@ -61,19 +61,7 @@ public final class ChatJob {
     private volatile String finishReason = "stop";
     private volatile String errorMessage;
 
-    /** Same-chat mode: last assistant ke baad ka sirf naya hissa (null = continue possible nahi). */
-    public final String followUp;
-    /** Client ke aakhri assistant message ka fingerprint (humare pichhle reply se match karne ke liye). */
-    public final String lastAssistantFp;
-
     public ChatJob(String prompt, String model, boolean think, boolean search, boolean stream, JSONArray files) {
-        this(prompt, model, think, search, stream, files, null, null);
-    }
-
-    public ChatJob(String prompt, String model, boolean think, boolean search, boolean stream, JSONArray files,
-                   String followUp, String lastAssistantFp) {
-        this.followUp = followUp;
-        this.lastAssistantFp = lastAssistantFp;
         this.prompt = prompt;
         this.model = model;
         this.think = think;
@@ -95,6 +83,17 @@ public final class ChatJob {
             touch();
             restartLatch.countDown();
         }
+    }
+
+    /** Doosre account par retry se pehle (client ko abhi tak koi content nahi gaya). */
+    public synchronized void resetForRetry() {
+        if (closed) return;
+        started = false;
+        endReason = null;
+        endError = null;
+        startLatch = new CountDownLatch(1);
+        endLatch = new CountDownLatch(1);
+        restartLatch = new CountDownLatch(1);
     }
 
     /** Continue click se pehle: naye stream ke liye end/restart latches reset. */

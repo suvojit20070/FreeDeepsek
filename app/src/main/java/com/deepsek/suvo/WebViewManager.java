@@ -8,20 +8,29 @@ import android.os.Looper;
 import android.provider.Settings;
 import android.util.DisplayMetrics;
 import android.view.Gravity;
+import android.view.View;
 import android.view.ViewGroup;
 import android.view.ViewParent;
 import android.view.WindowManager;
+import android.webkit.WebView;
 import android.widget.FrameLayout;
 
+import androidx.webkit.ProfileStore;
+import androidx.webkit.WebViewCompat;
+import androidx.webkit.WebViewFeature;
+
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
 /**
- * Single WebView ka owner.
+ * Har DeepSeek account ka apna WebView (alag WebView Profile = alag cookies/storage/login).
  *
- * Fix 1: WebView MutableContextWrapper(appContext) se bana hai. Activity attach par
- *        base context = Activity, detach par wapas appContext. Activity leak nahi hoti.
- * Fix 2: Activity band hone par detached WebView ko Chromium throttle kar deta hai.
- *        Isliye use 1x1 px overlay window mein park karte hain. Andar WebView full
- *        screen size par layout hota hai, bas window 1px ki hai, toh page "visible"
- *        rehta hai aur JS/stream normal chalti hai.
+ * - WebViews MutableContextWrapper se bane hain: Activity attach par base = Activity, detach par appContext.
+ * - Activity par saare WebViews ek ke upar ek (stack) lagte hain, dikhne wala account sabse upar.
+ *   Neeche wale bhi "visible" rehte hain, toh Chromium unhe throttle nahi karta.
+ * - Activity band hone par saare 1x1 px overlay window mein park hote hain (andar full size layout).
  */
 public final class WebViewManager {
 
@@ -31,10 +40,16 @@ public final class WebViewManager {
         return INSTANCE;
     }
 
+    private static final class Holder {
+        MutableContextWrapper wrapper;
+        DeepSeekWebView web;
+    }
+
     private Context app;
-    private MutableContextWrapper wrapper;
-    private DeepSeekWebView webView;
+    private final Map<String, Holder> views = new LinkedHashMap<>();
     private ViewGroup activityHost;
+    private Activity activity;
+    private String shownId = Config.DEFAULT_ACCOUNT;
     private FrameLayout keeper;
     private boolean keeperAdded;
 
@@ -47,116 +62,227 @@ public final class WebViewManager {
         }
     }
 
-    /** Existing WebView lo, null ho toh naya banao. */
-    public DeepSeekWebView obtain(Context c) {
-        assertMain();
-        if (app == null) app = c.getApplicationContext();
-        if (webView == null) {
-            wrapper = new MutableContextWrapper(app);
-            webView = new DeepSeekWebView(wrapper);
-            webView.setup();
-            webView.loadUrl(DeepSeekAutomation.HOME_URL);
-            AppState.log("WebView created");
+    public static boolean multiProfileSupported() {
+        try {
+            return WebViewFeature.isFeatureSupported(WebViewFeature.MULTI_PROFILE);
+        } catch (Throwable t) {
+            return false;
         }
-        return webView;
     }
 
+    private static String profileName(String accId) {
+        return "fds_" + accId;
+    }
+
+    /* ---------------------------------------------------------------- obtain */
+
+    /** Account ka WebView lo, na ho toh banao (aur abhi wale parent mein laga do). */
+    public DeepSeekWebView obtain(Context c, String accId) {
+        assertMain();
+        if (app == null) app = c.getApplicationContext();
+        Holder h = views.get(accId);
+        if (h != null) return h.web;
+
+        h = new Holder();
+        h.wrapper = new MutableContextWrapper(activity != null ? activity : app);
+        h.web = new DeepSeekWebView(h.wrapper);
+        if (!Config.DEFAULT_ACCOUNT.equals(accId)) {
+            if (multiProfileSupported()) {
+                // Profile WebView use karne se PEHLE set hona chahiye
+                ProfileStore.getInstance().getOrCreateProfile(profileName(accId));
+                WebViewCompat.setProfile(h.web, profileName(accId));
+            } else {
+                AppState.log("Multi-profile support nahi (WebView update karo): "
+                        + Config.accountLabel(app, accId) + " default login share karega");
+            }
+        }
+        h.web.setup();
+        h.web.loadUrl(DeepSeekAutomation.HOME_URL);
+        views.put(accId, h);
+        AppState.log("WebView created: " + Config.accountLabel(app, accId));
+
+        // Jahan baaki WebViews hain wahin lagao
+        if (activityHost != null) {
+            addTo(activityHost, h.web, null);
+            bringShownToFront();
+        } else if (keeperAdded && keeper != null) {
+            addTo(keeper, h.web, fullSize());
+        }
+        return h.web;
+    }
+
+    /** Config ke saare accounts ke WebViews bana do; hataye gaye accounts ke destroy. */
+    public void ensureAll(Context c) {
+        assertMain();
+        if (app == null) app = c.getApplicationContext();
+        List<String> ids = Config.accountIds(app);
+        for (String id : ids) obtain(app, id);
+        for (String id : new ArrayList<>(views.keySet())) {
+            if (!ids.contains(id)) remove(id);
+        }
+        if (!views.containsKey(shownId)) shownId = ids.get(0);
+    }
+
+    public DeepSeekWebView get(String accId) {
+        Holder h = views.get(accId);
+        return h == null ? null : h.web;
+    }
+
+    /** Screen par dikhne wala account. */
     public DeepSeekWebView current() {
-        return webView;
+        return get(shownId);
+    }
+
+    public String shownId() {
+        return shownId;
     }
 
     public boolean isAttachedToActivity() {
         return activityHost != null;
     }
 
-    /** Activity.onStart se: WebView ko screen par dikhao. */
-    public void attach(Activity activity, ViewGroup host) {
+    /* ---------------------------------------------------------------- activity */
+
+    public void attach(Activity a, ViewGroup host) {
         assertMain();
-        DeepSeekWebView w = obtain(activity);
-        wrapper.setBaseContext(activity);
+        if (app == null) app = a.getApplicationContext();
+        activity = a;
+        ensureAll(a);
         removeKeeper();
-        detachFromParent(w);
-        host.addView(w, new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        for (Holder h : views.values()) {
+            h.wrapper.setBaseContext(a);
+            detachFromParent(h.web);
+            addTo(host, h.web, null);
+        }
         activityHost = host;
-        wake();
+        bringShownToFront();
+        wakeAll();
         AppState.setKeepAlive("activity");
     }
 
-    /** Activity.onStop se: Activity se hatao aur background mein park karo. */
     public void detach() {
         assertMain();
-        if (webView == null) return;
-        detachFromParent(webView);
+        for (Holder h : views.values()) {
+            detachFromParent(h.web);
+            h.wrapper.setBaseContext(app);
+        }
         activityHost = null;
-        wrapper.setBaseContext(app);
+        activity = null;
         park();
     }
 
-    /** Activity nahi hai toh WebView ko overlay keeper mein rakho (agar allowed ho). */
+    /** Kaunsa account screen par dikhe (login ke liye). */
+    public void show(String accId) {
+        assertMain();
+        if (!views.containsKey(accId)) obtain(app, accId);
+        shownId = accId;
+        bringShownToFront();
+    }
+
+    private void bringShownToFront() {
+        DeepSeekWebView w = current();
+        if (w == null || activityHost == null || w.getParent() != activityHost) return;
+        activityHost.bringChildToFront(w);
+        activityHost.requestLayout();
+        activityHost.invalidate();
+    }
+
+    /* ---------------------------------------------------------------- background */
+
     public void park() {
         assertMain();
-        if (webView == null || activityHost != null) return;
+        if (app == null || views.isEmpty() || activityHost != null) return;
         boolean canOverlay = Settings.canDrawOverlays(app);
         if (DeepSeekService.isRunning() && Config.keepAlive(app) && canOverlay) {
             addKeeper();
         } else {
             removeKeeper();
-            detachFromParent(webView);
+            for (Holder h : views.values()) detachFromParent(h.web);
             AppState.setKeepAlive(canOverlay || !Config.keepAlive(app)
                     ? "detached" : "detached (overlay permission nahi)");
         }
-        wake();
+        wakeAll();
     }
 
-    /** Service band hone par overlay hatao (WebView object zinda rehta hai). */
     public void unpark() {
         assertMain();
         removeKeeper();
-        if (webView != null && activityHost == null) detachFromParent(webView);
+        if (activityHost == null) for (Holder h : views.values()) detachFromParent(h.web);
+    }
+
+    /* ---------------------------------------------------------------- remove / reload */
+
+    public void remove(String accId) {
+        assertMain();
+        Holder h = views.remove(accId);
+        if (h == null) return;
+        detachFromParent(h.web);
+        try {
+            h.web.destroy();
+        } catch (Throwable ignored) {
+        }
+        if (!Config.DEFAULT_ACCOUNT.equals(accId) && multiProfileSupported()) {
+            try {
+                ProfileStore.getInstance().deleteProfile(profileName(accId));
+            } catch (Throwable t) {
+                AppState.log("Profile delete baad mein hoga: " + t.getMessage());
+            }
+        }
+        if (accId.equals(shownId)) {
+            shownId = views.isEmpty() ? Config.DEFAULT_ACCOUNT : views.keySet().iterator().next();
+            bringShownToFront();
+        }
     }
 
     public void reload() {
         assertMain();
-        if (webView != null) webView.loadUrl(DeepSeekAutomation.HOME_URL);
+        DeepSeekWebView w = current();
+        if (w != null) w.loadUrl(DeepSeekAutomation.HOME_URL);
     }
 
-    /** Renderer crash: purana WebView destroy, naya banao, wahi jagah wapas lagao. */
-    public void onRendererGone(android.webkit.WebView dead) {
+    /** Renderer crash: us account ka WebView dobara banao. */
+    public void onRendererGone(WebView dead) {
         assertMain();
-        if (dead != webView) return;
-        ViewGroup host = activityHost;
-        Context base = wrapper != null ? wrapper.getBaseContext() : null;
-        removeKeeper();
-        detachFromParent(dead);
+        String deadId = null;
+        for (Map.Entry<String, Holder> e : views.entrySet()) {
+            if (e.getValue().web == dead) deadId = e.getKey();
+        }
+        if (deadId == null) return;
+        Holder h = views.remove(deadId);
+        detachFromParent(h.web);
         try {
-            dead.destroy();
+            h.web.destroy();
         } catch (Throwable ignored) {
         }
-        webView = null;
-        activityHost = null;
-        if (host != null && base instanceof Activity && !((Activity) base).isFinishing()) {
-            attach((Activity) base, host);
-        } else if (app != null) {
-            obtain(app);
-            park();
+        if (app != null) obtain(app, deadId);
+    }
+
+    /* ---------------------------------------------------------------- helpers */
+
+    private void wakeAll() {
+        for (Holder h : views.values()) {
+            h.web.onResume();
+            h.web.resumeTimers();
         }
     }
 
-    private void wake() {
-        if (webView == null) return;
-        webView.onResume();
-        webView.resumeTimers();
+    private FrameLayout.LayoutParams fullSize() {
+        DisplayMetrics dm = app.getResources().getDisplayMetrics();
+        return new FrameLayout.LayoutParams(dm.widthPixels, dm.heightPixels);
+    }
+
+    private static void addTo(ViewGroup parent, View v, FrameLayout.LayoutParams lp) {
+        detachFromParent(v);
+        parent.addView(v, lp != null ? lp : new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
     }
 
     private void addKeeper() {
         if (keeperAdded) return;
         WindowManager wm = (WindowManager) app.getSystemService(Context.WINDOW_SERVICE);
         try {
-            DisplayMetrics dm = app.getResources().getDisplayMetrics();
             keeper = new FrameLayout(app);
-            detachFromParent(webView);
-            keeper.addView(webView, new FrameLayout.LayoutParams(dm.widthPixels, dm.heightPixels));
+            for (Holder h : views.values()) addTo(keeper, h.web, fullSize());
 
             WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
                     1, 1,
@@ -166,11 +292,9 @@ public final class WebViewManager {
                             | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
                     PixelFormat.TRANSLUCENT);
             lp.gravity = Gravity.TOP | Gravity.START;
-            lp.x = 0;
-            lp.y = 0;
             wm.addView(keeper, lp);
             keeperAdded = true;
-            AppState.setKeepAlive("overlay (background active)");
+            AppState.setKeepAlive("overlay · " + views.size() + " account(s)");
         } catch (Throwable t) {
             AppState.log("Overlay keep-alive failed: " + t.getMessage());
             if (keeper != null) keeper.removeAllViews();
@@ -194,7 +318,7 @@ public final class WebViewManager {
         keeperAdded = false;
     }
 
-    private static void detachFromParent(android.view.View v) {
+    private static void detachFromParent(View v) {
         if (v == null) return;
         ViewParent p = v.getParent();
         if (p instanceof ViewGroup) ((ViewGroup) p).removeView(v);
